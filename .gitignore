@@ -1,0 +1,5 @@
+/target
+# machine-specific toolchain paths (see README, "Selbst bauen")
+/.cargo/config.toml
+/shots
+*.tcraw
