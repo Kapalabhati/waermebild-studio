@@ -8,7 +8,7 @@ use crate::record::{
 };
 use crate::overlay::{annotate, font_px, Anchor, Annotations, ColorScale, Label};
 use crate::sim::DemoScene;
-use crate::stream::{json_num, json_str, StreamServer};
+use crate::stream::{json_num, json_str, Command, StreamServer};
 use crate::thermal::*;
 use eframe::egui::{
     self, Align, Align2, Color32, ColorImage, CornerRadius, FontId, Layout, Pos2, Rect, RichText, Sense, Stroke,
@@ -267,6 +267,9 @@ pub struct ThermoApp {
     stream_fps: f32,
     stream_scale: u32,
     stream_last: Option<Instant>,
+    remote_on: bool,
+    remote_pw: String,
+    egui_ctx: egui::Context,
     file_origin: Option<chrono::DateTime<chrono::Local>>,
     curve_for: Option<String>,
 
@@ -384,6 +387,9 @@ impl ThermoApp {
             stream_fps: 10.0,
             stream_scale: 2,
             stream_last: None,
+            remote_on: false,
+            remote_pw: String::new(),
+            egui_ctx: ctx.clone(),
             file_origin: None,
             curve_for: None,
             screenshot,
@@ -403,6 +409,10 @@ impl ThermoApp {
         app.log("Programm gestartet");
         // WBS_STREAM=<port>: start the network stream on this PC only (manual test)
         if let Some(port) = std::env::var("WBS_STREAM").ok().and_then(|v| v.parse().ok()) {
+            if let Ok(pw) = std::env::var("WBS_REMOTE_PW") {
+                app.remote_on = true;
+                app.remote_pw = pw;
+            }
             app.stream_port = port;
             app.stream_network = false;
             app.toggle_stream();
@@ -1169,8 +1179,9 @@ impl ThermoApp {
             self.log("Netzwerk-Stream beendet");
             return;
         }
-        match StreamServer::start(self.stream_port, self.stream_network) {
+        match StreamServer::start(self.stream_port, self.stream_network, self.egui_ctx.clone()) {
             Ok(s) => {
+                s.set_password(self.remote_password());
                 let url = s.urls().first().cloned().unwrap_or_default();
                 self.log(format!("Netzwerk-Stream gestartet: {url}"));
                 self.stream = Some(s);
@@ -1227,8 +1238,250 @@ impl ThermoApp {
         )
     }
 
+    /// Settings and tools for the control page (/api/zustand).
+    fn remote_state_json(&self) -> String {
+        let u = self.unit;
+        let (w, h) = self.frame_size();
+        let b = |v: bool| if v { "true" } else { "false" };
+        let f = |v: f32| json_num(v);
+        let pal_idx = Palette::ALL.iter().position(|p| *p == self.palette).unwrap_or(0);
+        let paletten: Vec<String> = Palette::ALL.iter().map(|p| json_str(p.name())).collect();
+        let materialien: Vec<String> = MATERIALS.iter().map(|(n, e)| format!("[{},{}]", json_str(n), f(*e))).collect();
+        let einheit = match u {
+            TempUnit::Celsius => "C",
+            TempUnit::Fahrenheit => "F",
+            TempUnit::Kelvin => "K",
+        };
+        let e = &self.emission;
+        let einstellungen = format!(
+            "{{\"palette\":\"{}\",\"bereich\":\"{}\",\"von\":{},\"bis\":{},\"iso\":{},\"iso_ab\":{},\"weich\":{},\"rauschen\":\"{}\",\"drehung\":\"{}\",\"spiegel_h\":{},\"spiegel_v\":{},\"max\":{},\"min\":{},\"mitte\":{},\"standbild\":{},\"einheit\":\"{}\",\"e\":{},\"refl\":{},\"luft\":{},\"abstand\":{},\"feuchte\":{},\"offset\":{},\"foto_groesse\":\"{}\",\"intervall_alle\":{},\"intervall_anzahl\":{}}}",
+            pal_idx,
+            if self.range_mode == RangeMode::Auto { "auto" } else { "fest" },
+            f(self.man_lo),
+            f(self.man_hi),
+            b(self.iso_on),
+            f(self.iso_above),
+            b(self.smooth_view),
+            self.noise_filter,
+            self.rotation,
+            b(self.flip_h),
+            b(self.flip_v),
+            b(self.show_max),
+            b(self.show_min),
+            b(self.show_center),
+            b(self.frozen),
+            einheit,
+            f(e.emissivity),
+            f(e.reflected_c),
+            f(e.ambient_c),
+            f(e.distance_m),
+            json_num((e.humidity * 100.0).round()),
+            f(e.offset_c),
+            self.photo_scale,
+            f(self.interval.every_s),
+            self.interval.max_count
+        );
+        let mut tools = Vec::new();
+        for t in &self.tools {
+            let details = match t.shape {
+                Shape::Spot { x, y } => format!("Position {} / {}", x as i32, y as i32),
+                _ => format!(
+                    "Max {} · Ø {} · Min {}",
+                    fmt_t(t.reading.max, u),
+                    fmt_t(t.reading.avg, u),
+                    fmt_t(t.reading.min, u)
+                ),
+            };
+            let c = t.color;
+            tools.push(format!(
+                "{{\"id\":{},\"name\":{},\"art\":{},\"farbe\":\"#{:02x}{:02x}{:02x}\",\"metriken\":[{},{},{}],\"verlauf\":{},\"hi_an\":{},\"hi\":{},\"lo_an\":{},\"lo\":{},\"wert\":{},\"details\":{},\"alarm\":{}}}",
+                t.id,
+                json_str(&t.name),
+                json_str(t.kind_name()),
+                c.r(),
+                c.g(),
+                c.b(),
+                b(t.metrics[0]),
+                b(t.metrics[1]),
+                b(t.metrics[2]),
+                b(t.in_chart),
+                b(t.hi_on),
+                f(t.hi),
+                b(t.lo_on),
+                f(t.lo),
+                json_str(&fmt_t(tool_value(t), u)),
+                json_str(&details),
+                b(t.in_alarm)
+            ));
+        }
+        let ereignisse: Vec<String> = self.events.iter().take(12).map(|e| json_str(e)).collect();
+        let quelle = match &self.source {
+            Source::Camera(name) => format!("Live: {name}"),
+            Source::Demo(_) => "Demo".to_string(),
+            Source::Playback(pb) => format!("Datei: {}", pb.name),
+            Source::None => "keine Quelle".to_string(),
+        };
+        format!(
+            "{{\"zeit\":{},\"quelle\":{},\"breite\":{},\"hoehe\":{},\"skalierung\":{},\"einheit\":{},\"werte\":{{\"max\":{},\"min\":{},\"mitte\":{},\"mittel\":{}}},\"paletten\":[{}],\"materialien\":[{}],\"einstellungen\":{},\"werkzeuge\":[{}],\"aufnahme\":{{\"video\":{},\"intervall\":{},\"intervall_zaehler\":{},\"rohdaten\":{},\"protokoll\":{}}},\"ereignisse\":[{}]}}",
+            json_str(&chrono::Local::now().format("%d.%m.%Y %H:%M:%S").to_string()),
+            json_str(&quelle),
+            w,
+            h,
+            self.stream_scale.max(1),
+            json_str(u.label()),
+            json_num(u.from_c(self.stats.max)),
+            json_num(u.from_c(self.stats.min)),
+            json_num(u.from_c(self.stats.center)),
+            json_num(u.from_c(self.stats.mean)),
+            paletten.join(","),
+            materialien.join(","),
+            einstellungen,
+            tools.join(","),
+            b(self.video.is_some()),
+            b(self.interval.active),
+            self.interval.count,
+            b(self.raw_rec.is_some()),
+            b(self.logger.is_some()),
+            ereignisse.join(",")
+        )
+    }
+
+    /// Carries out a command from the control page.
+    fn apply_command(&mut self, c: Command) {
+        let (w, h) = self.frame_size();
+        match c.action.as_str() {
+            "set" => {
+                let key = c.get("key").unwrap_or("").to_string();
+                let num = c.num("value");
+                let on = c.flag("value").unwrap_or(false);
+                let val = c.get("value").unwrap_or("");
+                match (key.as_str(), num) {
+                    ("palette", Some(v)) => {
+                        if let Some(p) = Palette::ALL.get(v as usize) {
+                            self.palette = *p;
+                        }
+                    }
+                    ("bereich", _) => self.range_mode = if val == "fest" { RangeMode::Manual } else { RangeMode::Auto },
+                    ("von", Some(v)) => self.man_lo = v.clamp(-50.0, 600.0),
+                    ("bis", Some(v)) => self.man_hi = v.clamp(-50.0, 600.0),
+                    ("iso", _) => self.iso_on = on,
+                    ("iso_ab", Some(v)) => self.iso_above = v.clamp(-50.0, 600.0),
+                    ("weich", _) => self.smooth_view = on,
+                    ("rauschen", Some(v)) => self.noise_filter = (v as u8).min(3),
+                    ("drehung", Some(v)) => self.rotation = (v as u8) % 4,
+                    ("spiegel_h", _) => self.flip_h = on,
+                    ("spiegel_v", _) => self.flip_v = on,
+                    ("max", _) => self.show_max = on,
+                    ("min", _) => self.show_min = on,
+                    ("mitte", _) => self.show_center = on,
+                    ("einheit", _) => {
+                        self.unit = match val {
+                            "F" => TempUnit::Fahrenheit,
+                            "K" => TempUnit::Kelvin,
+                            _ => TempUnit::Celsius,
+                        }
+                    }
+                    ("e", Some(v)) => self.emission.emissivity = v.clamp(0.01, 1.0),
+                    ("refl", Some(v)) => self.emission.reflected_c = v.clamp(-50.0, 600.0),
+                    ("luft", Some(v)) => self.emission.ambient_c = v.clamp(-50.0, 100.0),
+                    ("abstand", Some(v)) => self.emission.distance_m = v.clamp(0.0, 100.0),
+                    ("feuchte", Some(v)) => self.emission.humidity = (v / 100.0).clamp(0.0, 1.0),
+                    ("offset", Some(v)) => self.emission.offset_c = v.clamp(-20.0, 20.0),
+                    ("foto_groesse", Some(v)) => {
+                        if [1, 2, 4, 6].contains(&(v as u32)) {
+                            self.photo_scale = v as u32;
+                        }
+                    }
+                    ("intervall_alle", Some(v)) => self.interval.every_s = v.clamp(0.5, 86400.0),
+                    ("intervall_anzahl", Some(v)) => self.interval.max_count = v.clamp(0.0, 100000.0) as u32,
+                    _ => {}
+                }
+            }
+            "bereich_uebernehmen" => {
+                self.man_lo = (self.stats.min * 2.0).floor() / 2.0;
+                self.man_hi = (self.stats.max * 2.0).ceil() / 2.0;
+                self.range_mode = RangeMode::Manual;
+            }
+            "emission_zuruecksetzen" => self.emission = EmissionSettings::default(),
+            "standbild" => self.frozen = !self.frozen,
+            "neu" => {
+                let (Some(x0), Some(y0)) = (c.num("x0"), c.num("y0")) else { return };
+                let cx = |v: f32| v.clamp(0.0, w as f32 - 1.0);
+                let cy = |v: f32| v.clamp(0.0, h as f32 - 1.0);
+                let (x1, y1) = (c.num("x1").unwrap_or(x0), c.num("y1").unwrap_or(y0));
+                let shape = match c.get("art") {
+                    Some("punkt") => Shape::Spot { x: cx(x0), y: cy(y0) },
+                    Some("bereich") => Shape::Area { x0: cx(x0.min(x1)), y0: cy(y0.min(y1)), x1: cx(x0.max(x1)), y1: cy(y0.max(y1)) },
+                    Some("linie") => Shape::Line { x0: cx(x0), y0: cy(y0), x1: cx(x1), y1: cy(y1) },
+                    _ => return,
+                };
+                let id = self.add_tool(shape);
+                self.selected_tool = Some(id);
+                self.log("Messwerkzeug über die Fernsteuerung gesetzt");
+            }
+            "werkzeug" => {
+                let Some(id) = c.num("id").map(|v| v as u32) else { return };
+                let field = c.get("feld").unwrap_or("").to_string();
+                let num = c.num("wert");
+                let on = c.flag("wert").unwrap_or(false);
+                let text = c.get("wert").unwrap_or("").to_string();
+                if let Some(t) = self.tools.iter_mut().find(|t| t.id == id) {
+                    match (field.as_str(), num) {
+                        ("name", _) => {
+                            let n: String = text.trim().chars().take(12).collect();
+                            if !n.is_empty() {
+                                t.name = n;
+                            }
+                        }
+                        ("metrik0", _) => t.metrics[0] = on,
+                        ("metrik1", _) => t.metrics[1] = on,
+                        ("metrik2", _) => t.metrics[2] = on,
+                        ("verlauf", _) => t.in_chart = on,
+                        ("hi_an", _) => t.hi_on = on,
+                        ("hi", Some(v)) => t.hi = v.clamp(-50.0, 600.0),
+                        ("lo_an", _) => t.lo_on = on,
+                        ("lo", Some(v)) => t.lo = v.clamp(-50.0, 600.0),
+                        _ => {}
+                    }
+                }
+            }
+            "loeschen" => {
+                if let Some(id) = c.num("id") {
+                    self.remove_tool(id as u32);
+                }
+            }
+            "alle_loeschen" => {
+                let ids: Vec<u32> = self.tools.iter().map(|t| t.id).collect();
+                for id in ids {
+                    self.remove_tool(id);
+                }
+            }
+            "foto" => self.take_photo(),
+            "intervall" => self.toggle_interval(),
+            "video" => self.toggle_video(),
+            "rohdaten" => self.toggle_raw(),
+            "protokoll" => self.toggle_logger(),
+            _ => {}
+        }
+    }
+
     /// Sends the current picture (only when someone watches) and values, at most `stream_fps` times a second.
+    /// The control password, if remote control is switched on and the password is long enough.
+    fn remote_password(&self) -> Option<String> {
+        (self.remote_on && self.remote_pw.chars().count() >= 4).then(|| self.remote_pw.clone())
+    }
+
     fn stream_tick(&mut self) {
+        let Some(srv) = &self.stream else { return };
+        srv.set_password(self.remote_password());
+        let cmds = srv.take_commands();
+        let had_cmds = !cmds.is_empty();
+        for c in cmds {
+            self.apply_command(c);
+        }
+        if had_cmds {
+            self.stream_last = None; // show the effect right away
+        }
         let Some(srv) = &self.stream else { return };
         if self.frame.is_none() {
             return;
@@ -1238,6 +1491,10 @@ impl ThermoApp {
             return;
         }
         self.stream_last = Some(Instant::now());
+        if srv.sessions() > 0 {
+            srv.publish_state(self.remote_state_json());
+        }
+        let Some(srv) = &self.stream else { return };
         let json = self.stream_json();
         if srv.viewers() == 0 {
             srv.publish_values(json);
@@ -2366,6 +2623,16 @@ impl ThermoApp {
                 }
             });
         });
+        ui.checkbox(&mut self.remote_on, "Fernsteuerung im Browser erlauben (mit Passwort)");
+        ui.add_enabled_ui(self.remote_on, |ui| {
+            ui.horizontal(|ui| {
+                ui.label("Passwort");
+                ui.add(egui::TextEdit::singleline(&mut self.remote_pw).password(true).desired_width(160.0));
+            });
+            if self.remote_on && self.remote_pw.chars().count() < 4 {
+                ui.label(RichText::new("Mindestens 4 Zeichen – vorher bleibt die Steuerung gesperrt.").small().color(REC));
+            }
+        });
         let st = if let Some(s) = &self.stream { format!("⏹ Stream beenden ({} Zuschauer)", s.viewers()) } else { "📡 Stream starten".into() };
         if ui.add(big_button(&st, self.stream.is_some())).clicked() {
             self.toggle_stream();
@@ -2376,9 +2643,19 @@ impl ThermoApp {
                 ui.hyperlink_to(RichText::new(&u).monospace(), &u);
             }
             ui.label(RichText::new(format!("Für VLC/OBS: {}stream.mjpg", s.urls()[0])).small().color(MUTED));
+            if self.remote_password().is_some() {
+                let u = format!("{}steuerung", s.urls()[0]);
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Steuerung:").small());
+                    ui.hyperlink_to(RichText::new(&u).monospace(), &u);
+                });
+                if s.sessions() > 0 {
+                    ui.label(RichText::new(format!("{} Steuerung(en) angemeldet", s.sessions())).small().color(ACCENT));
+                }
+            }
         }
         ui.label(
-            RichText::new("Zeigt Live-Bild mit Beschriftung und die Messwerte auf einer Webseite. „Im Netzwerk“: jedes Gerät im selben Netz kann zusehen (ohne Passwort) – nur in vertrauenswürdigen Netzen nutzen. Beim ersten Start fragt die Windows-Firewall nach.")
+            RichText::new("Zeigt Live-Bild mit Beschriftung und die Messwerte auf einer Webseite. Ansehen geht ohne Passwort – „im Netzwerk“ kann also jedes Gerät im selben Netz zusehen. Die Steuerseite verlangt das Passwort; es wird unverschlüsselt (HTTP) übertragen, daher nur in vertrauenswürdigen Netzen nutzen und kein Passwort verwenden, das woanders gilt. Das Passwort wird nicht gespeichert. Beim ersten Start fragt die Windows-Firewall nach.")
                 .small()
                 .color(MUTED),
         );

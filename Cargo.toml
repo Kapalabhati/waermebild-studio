@@ -1,6 +1,6 @@
 [package]
 name = "waermebild-studio"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "Desktop-App für USB-Wärmebildkameras: Live-Bild, Messpunkte, Temperaturverlauf, Rohdaten, Foto/Intervall/Video"
 
@@ -16,6 +16,7 @@ chrono = "0.4"
 ab_glyph = "0.2"
 epaint_default_fonts = "0.37"
 rfd = "0.17"
+getrandom = "0.2"
 rusb = { version = "0.9", features = ["vendored"] }
 libusb1-sys = { version = "0.7", features = ["vendored"] }
 libc = "0.2"

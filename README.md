@@ -35,8 +35,13 @@ Aufnahmen später neu aus. Die Oberfläche ist auf Deutsch.
 - eingebauter Webserver: Live-Bild mit Beschriftung und aktuelle Messwerte im Browser,
   auf jedem Gerät im selben Netz (oder nur auf diesem PC)
 - `/stream.mjpg` für VLC oder OBS, `/bild.jpg` als Einzelbild, `/werte.json` für eigene Auswertungen
-- Port, Bildgröße und Bilder pro Sekunde einstellbar; ohne Passwort, daher nur in
-  vertrauenswürdigen Netzen verwenden
+- Port, Bildgröße und Bilder pro Sekunde einstellbar; das Ansehen geht ohne Passwort, daher
+  nur in vertrauenswürdigen Netzen verwenden
+- **Fernsteuerung** unter `/steuerung`, geschützt durch ein Passwort, das im Programm gesetzt
+  wird: Palette, Temperaturbereich, Isotherme, Darstellung, Emissionswerte, Messwerkzeuge
+  setzen (Klick bzw. Ziehen ins Bild), ändern und löschen, Foto, Intervall, Video, Rohdaten
+  und Protokoll starten. Die Übertragung ist unverschlüsseltes HTTP; das Passwort wird nicht
+  gespeichert
 
 **Auswerten**
 - Fotos, Rohdaten-Aufnahmen, ganze Intervall-Serien und CSV-Tabellen öffnen

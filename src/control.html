@@ -1,0 +1,375 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Wärmebild-Studio Steuerung</title>
+<style>
+  :root { color-scheme: dark; --bg:#15171c; --panel:#1c1f26; --card:#24282f; --line:#333842; --muted:#969caa; --hot:#ff5440; --cold:#46a0ff; --accent:#ff8a1f; --rec:#e63232; }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: #eee; font: 14px/1.4 system-ui, "Segoe UI", sans-serif; }
+  header { display: flex; align-items: center; gap: 12px; padding: 10px 16px; background: #111318; flex-wrap: wrap; }
+  header h1 { font-size: 18px; margin: 0; font-weight: 600; }
+  header .sp { flex: 1; }
+  #state { color: var(--muted); font-size: 13px; }
+  #state.ok::before { content: "● "; color: #50dc78; }
+  button, select, input { font: inherit; color: #eee; background: var(--card); border: 1px solid var(--line); border-radius: 6px; padding: 5px 9px; }
+  button { cursor: pointer; }
+  button:hover { border-color: #555b68; }
+  button.on { background: var(--accent); border-color: var(--accent); color: #111; }
+  button.rec.on { background: var(--rec); border-color: var(--rec); color: #fff; }
+  input[type=number] { width: 84px; }
+  input[type=checkbox], input[type=radio] { accent-color: var(--accent); }
+  main { display: grid; grid-template-columns: minmax(0, 1fr) 360px; gap: 14px; padding: 14px; }
+  @media (max-width: 900px) { main { grid-template-columns: 1fr; } }
+  .toolbar { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 8px; align-items: center; }
+  .toolbar .hint { color: var(--muted); font-size: 12px; margin-left: 4px; }
+  .view { position: relative; background: #0c0d10; border-radius: 8px; overflow: hidden; line-height: 0; }
+  .view img { width: 100%; height: auto; display: block; user-select: none; -webkit-user-drag: none; }
+  .view canvas { position: absolute; inset: 0; width: 100%; height: 100%; cursor: crosshair; touch-action: none; }
+  .side { background: var(--panel); border-radius: 8px; padding: 10px; min-width: 0; }
+  .tabs { display: flex; gap: 4px; margin-bottom: 10px; flex-wrap: wrap; }
+  .tabs button { flex: 1; }
+  .pane { display: none; }
+  .pane.show { display: block; }
+  .card { background: var(--card); border-radius: 8px; padding: 10px 12px; margin-bottom: 10px; }
+  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+  .lbl { color: var(--muted); font-size: 12px; }
+  .big { font-size: 20px; font-weight: 600; }
+  h3 { font-size: 13px; font-weight: 600; color: var(--accent); margin: 12px 0 6px; }
+  h3:first-child { margin-top: 0; }
+  .row { display: flex; align-items: center; gap: 8px; margin: 6px 0; flex-wrap: wrap; }
+  .row label { display: inline-flex; align-items: center; gap: 5px; }
+  .form { display: grid; grid-template-columns: 1fr auto; gap: 6px 10px; align-items: center; }
+  .tool { border-left: 4px solid; padding-left: 9px; }
+  .tool .top { display: flex; align-items: center; gap: 8px; }
+  .tool .val { margin-left: auto; font-size: 17px; font-weight: 600; }
+  .tool .val.alarm { color: var(--hot); }
+  .tool .sub { color: var(--muted); font-size: 12px; margin: 3px 0; }
+  .tool input[type=text] { width: 64px; }
+  .tool input[type=number] { width: 70px; }
+  .muted { color: var(--muted); font-size: 12px; }
+  .events { font-size: 12px; color: #bbb; max-height: 160px; overflow: auto; }
+  .events .w { color: var(--hot); }
+  #login { max-width: 360px; margin: 12vh auto; background: var(--panel); border-radius: 10px; padding: 24px; }
+  #login h2 { margin: 0 0 12px; font-size: 18px; }
+  #login input { width: 100%; margin: 8px 0 12px; padding: 9px; }
+  #login button { width: 100%; padding: 9px; background: var(--accent); color: #111; border: 0; font-weight: 600; }
+  #loginmsg { color: var(--hot); min-height: 1.4em; margin-top: 10px; }
+  a { color: var(--accent); }
+  .hidden { display: none !important; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Wärmebild-Studio · Steuerung</h1>
+  <span class="sp"></span>
+  <span id="state">verbinde …</span>
+  <a href="./">Nur ansehen</a>
+  <button id="logout" class="hidden">Abmelden</button>
+</header>
+
+<div id="login" class="hidden">
+  <h2>Anmelden</h2>
+  <div class="muted" id="logintext">Für die Steuerung bitte das Passwort eingeben, das im Programm unter „Aufnahme → Netzwerk-Stream“ festgelegt ist.</div>
+  <form id="loginform">
+    <input type="password" id="pw" autocomplete="current-password" placeholder="Passwort" autofocus>
+    <button type="submit">Anmelden</button>
+  </form>
+  <div id="loginmsg"></div>
+</div>
+
+<main id="app" class="hidden">
+  <div>
+    <div class="toolbar">
+      <button data-mode="" class="on" title="Nur ansehen">👆 Ansehen</button>
+      <button data-mode="punkt" title="Klick ins Bild setzt einen Messpunkt">+ Punkt</button>
+      <button data-mode="bereich" title="Im Bild ziehen">⬜ Bereich</button>
+      <button data-mode="linie" title="Im Bild ziehen">╱ Linie</button>
+      <span class="hint" id="modehint"></span>
+      <span class="sp" style="flex:1"></span>
+      <button id="b_foto" title="Foto im Programm speichern">📷 Foto</button>
+      <button id="b_video" class="rec">⏺ Video</button>
+      <button id="b_intervall" class="rec">⏱ Intervall</button>
+      <button id="b_standbild" title="Bild anhalten">⏸ Standbild</button>
+    </div>
+    <div class="view">
+      <img id="live" src="stream.mjpg" alt="Live-Wärmebild">
+      <canvas id="draw"></canvas>
+    </div>
+    <div class="muted" style="margin-top:6px" id="info">–</div>
+  </div>
+
+  <div class="side">
+    <div class="tabs">
+      <button data-tab="werte" class="on">Messwerte</button>
+      <button data-tab="bild">Bild</button>
+      <button data-tab="emission">Emission</button>
+      <button data-tab="aufnahme">Aufnahme</button>
+    </div>
+
+    <div class="pane show" id="p_werte">
+      <div class="card grid2">
+        <div><div class="lbl">Maximum</div><div class="big" id="v_max" style="color:var(--hot)">–</div></div>
+        <div><div class="lbl">Minimum</div><div class="big" id="v_min" style="color:var(--cold)">–</div></div>
+        <div><div class="lbl">Bildmitte</div><div class="big" id="v_mitte">–</div></div>
+        <div><div class="lbl">Mittelwert</div><div class="big" id="v_mittel">–</div></div>
+      </div>
+      <div class="row"><b>Messwerkzeuge</b><span class="sp" style="flex:1"></span><button id="b_alle_loeschen" title="Alle Messwerkzeuge löschen">🗑 alle</button></div>
+      <div id="tools"></div>
+      <h3>Ereignisse</h3>
+      <div class="card events" id="events"></div>
+    </div>
+
+    <div class="pane" id="p_bild">
+      <h3>Farbpalette</h3>
+      <select id="s_palette" data-key="palette" style="width:100%"></select>
+      <h3>Temperaturbereich</h3>
+      <div class="row">
+        <label><input type="radio" name="bereich" value="auto" data-key="bereich"> Automatisch</label>
+        <label><input type="radio" name="bereich" value="fest" data-key="bereich"> Fest</label>
+      </div>
+      <div class="row">von <input type="number" step="0.5" data-key="von"> bis <input type="number" step="0.5" data-key="bis"> °C</div>
+      <div class="row"><button id="b_bereich">Aktuellen Bereich übernehmen</button></div>
+      <h3>Isotherme</h3>
+      <div class="row"><label><input type="checkbox" data-key="iso"> Alles über</label> <input type="number" step="0.5" data-key="iso_ab"> °C</div>
+      <h3>Markierungen</h3>
+      <div class="row">
+        <label><input type="checkbox" data-key="max"> Max</label>
+        <label><input type="checkbox" data-key="min"> Min</label>
+        <label><input type="checkbox" data-key="mitte"> Mitte</label>
+      </div>
+      <h3>Darstellung</h3>
+      <div class="row"><label><input type="checkbox" data-key="weich"> weich zeichnen</label></div>
+      <div class="row">Rauschfilter
+        <select data-key="rauschen"><option value="0">Aus</option><option value="1">Leicht</option><option value="2">Mittel</option><option value="3">Stark</option></select>
+      </div>
+      <div class="row">Drehung
+        <select data-key="drehung"><option value="0">0°</option><option value="1">90°</option><option value="2">180°</option><option value="3">270°</option></select>
+      </div>
+      <div class="row">
+        <label><input type="checkbox" data-key="spiegel_h"> horizontal spiegeln</label>
+        <label><input type="checkbox" data-key="spiegel_v"> vertikal spiegeln</label>
+      </div>
+      <div class="row">Einheit
+        <select data-key="einheit"><option value="C">°C</option><option value="F">°F</option><option value="K">K</option></select>
+      </div>
+    </div>
+
+    <div class="pane" id="p_emission">
+      <h3>Emissionsgrad ε</h3>
+      <div class="row"><input type="range" min="0.01" max="1" step="0.01" data-key="e" id="r_e" style="flex:1"> <input type="number" min="0.01" max="1" step="0.01" data-key="e"></div>
+      <div class="row">Material <select id="s_material" style="flex:1"></select></div>
+      <h3>Umgebung</h3>
+      <div class="form">
+        <span>Reflektierte Temperatur (°C)</span><input type="number" step="0.5" data-key="refl">
+        <span>Lufttemperatur (°C)</span><input type="number" step="0.5" data-key="luft">
+        <span>Entfernung (m)</span><input type="number" step="0.1" min="0" data-key="abstand">
+        <span>Luftfeuchte (%)</span><input type="number" step="1" min="0" max="100" data-key="feuchte">
+        <span>Korrektur (°C)</span><input type="number" step="0.1" data-key="offset">
+      </div>
+      <div class="row"><button id="b_emission_reset">Zurücksetzen (ε 0,95 · 22 °C · 1 m)</button></div>
+    </div>
+
+    <div class="pane" id="p_aufnahme">
+      <div class="muted">Aufnahmen werden im Programm auf dem PC gespeichert.</div>
+      <h3>📷 Foto</h3>
+      <div class="row">Größe
+        <select data-key="foto_groesse"><option value="1">1×</option><option value="2">2×</option><option value="4">4×</option><option value="6">6×</option></select>
+        <button id="b_foto2">Foto aufnehmen</button>
+      </div>
+      <h3>⏱ Intervall-Fotos</h3>
+      <div class="row">alle <input type="number" min="0.5" step="0.5" data-key="intervall_alle"> s · Anzahl <input type="number" min="0" step="1" data-key="intervall_anzahl"></div>
+      <div class="row"><button id="b_intervall2" class="rec">Intervall starten</button></div>
+      <h3>⏺ Video</h3>
+      <div class="row"><button id="b_video2" class="rec">Video starten</button></div>
+      <h3>💾 Rohdaten</h3>
+      <div class="row"><button id="b_rohdaten" class="rec">Rohdaten aufzeichnen</button></div>
+      <h3>📝 Temperatur-Protokoll</h3>
+      <div class="row"><button id="b_protokoll" class="rec">Protokoll starten</button></div>
+    </div>
+  </div>
+</main>
+
+<script>
+const $ = id => document.getElementById(id);
+let S = null;          // last state from the program
+let mode = "";         // tool to place
+let drag = null;
+
+async function cmd(params) {
+  const body = new URLSearchParams(params).toString();
+  try {
+    const r = await fetch("api/befehl", { method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded", "X-WBS": "1" }, body });
+    if (r.status === 401) return showLogin();
+    setTimeout(poll, 150);
+  } catch (e) {}
+}
+const set = (key, value) => cmd({ aktion: "set", key, value });
+const fmt = (v, u) => v === null || v === undefined ? "–" : v.toFixed(1).replace(".", ",") + " " + u;
+
+// ---------- login
+function showLogin(msg) {
+  $("app").classList.add("hidden"); $("logout").classList.add("hidden");
+  $("login").classList.remove("hidden");
+  if (msg) $("loginmsg").textContent = msg;
+}
+$("loginform").addEventListener("submit", async e => {
+  e.preventDefault();
+  $("loginmsg").textContent = "";
+  const r = await fetch("api/login", { method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" }, body: new URLSearchParams({ passwort: $("pw").value }).toString() });
+  const d = await r.json().catch(() => ({}));
+  if (r.ok) { $("pw").value = ""; start(); } else { $("loginmsg").textContent = d.fehler || "Anmeldung fehlgeschlagen"; }
+});
+$("logout").addEventListener("click", async () => { await fetch("api/logout", { method: "POST" }); showLogin(); });
+
+// ---------- tabs and modes
+document.querySelectorAll(".tabs button").forEach(b => b.addEventListener("click", () => {
+  document.querySelectorAll(".tabs button").forEach(x => x.classList.toggle("on", x === b));
+  document.querySelectorAll(".pane").forEach(p => p.classList.toggle("show", p.id === "p_" + b.dataset.tab));
+}));
+const hints = { "": "", punkt: "Ins Bild klicken", bereich: "Im Bild ziehen", linie: "Im Bild ziehen" };
+document.querySelectorAll("[data-mode]").forEach(b => b.addEventListener("click", () => {
+  mode = b.dataset.mode;
+  document.querySelectorAll("[data-mode]").forEach(x => x.classList.toggle("on", x === b));
+  $("modehint").textContent = hints[mode];
+}));
+
+// ---------- settings inputs: send on change
+document.querySelectorAll("[data-key]").forEach(el => {
+  el.addEventListener("change", () => {
+    let v = el.type === "checkbox" ? (el.checked ? "1" : "0") : el.value;
+    if (el.type === "radio" && !el.checked) return;
+    set(el.dataset.key, v);
+  });
+});
+$("r_e").addEventListener("input", () => { document.querySelector('input[type=number][data-key=e]').value = $("r_e").value; });
+$("s_material").addEventListener("change", () => { if ($("s_material").value) set("e", $("s_material").value); });
+const click = (id, params) => $(id).addEventListener("click", () => cmd(params));
+click("b_foto", { aktion: "foto" }); click("b_foto2", { aktion: "foto" });
+click("b_video", { aktion: "video" }); click("b_video2", { aktion: "video" });
+click("b_intervall", { aktion: "intervall" }); click("b_intervall2", { aktion: "intervall" });
+click("b_rohdaten", { aktion: "rohdaten" }); click("b_protokoll", { aktion: "protokoll" });
+click("b_standbild", { aktion: "standbild" });
+click("b_bereich", { aktion: "bereich_uebernehmen" });
+click("b_emission_reset", { aktion: "emission_zuruecksetzen" });
+$("b_alle_loeschen").addEventListener("click", () => { if (confirm("Alle Messwerkzeuge löschen?")) cmd({ aktion: "alle_loeschen" }); });
+
+// ---------- placing tools on the picture
+const cv = $("draw"), ctx = cv.getContext("2d"), img = $("live");
+function toImg(ev) {
+  if (!S) return null;
+  const r = cv.getBoundingClientRect();
+  const nw = img.naturalWidth || 1, nh = img.naturalHeight || 1;
+  const jx = (ev.clientX - r.left) / r.width * nw, jy = (ev.clientY - r.top) / r.height * nh;
+  const x = jx / S.skalierung - 0.5, y = jy / S.skalierung - 0.5;
+  return { x, y, sx: ev.clientX - r.left, sy: ev.clientY - r.top, inside: x >= -0.5 && y >= -0.5 && x < S.breite && y < S.hoehe };
+}
+const clamp = (v, m) => Math.max(0, Math.min(m - 1, v));
+cv.addEventListener("pointerdown", ev => {
+  if (!mode) return;
+  const p = toImg(ev); if (!p || !p.inside) return;
+  if (mode === "punkt") { cmd({ aktion: "neu", art: "punkt", x0: clamp(p.x, S.breite).toFixed(1), y0: clamp(p.y, S.hoehe).toFixed(1) }); return; }
+  drag = { a: p, b: p }; cv.setPointerCapture(ev.pointerId);
+});
+cv.addEventListener("pointermove", ev => {
+  if (!drag) return;
+  drag.b = toImg(ev);
+  cv.width = cv.clientWidth; cv.height = cv.clientHeight;
+  ctx.strokeStyle = "#ff8a1f"; ctx.lineWidth = 2; ctx.setLineDash([6, 4]);
+  if (mode === "bereich") ctx.strokeRect(drag.a.sx, drag.a.sy, drag.b.sx - drag.a.sx, drag.b.sy - drag.a.sy);
+  else { ctx.beginPath(); ctx.moveTo(drag.a.sx, drag.a.sy); ctx.lineTo(drag.b.sx, drag.b.sy); ctx.stroke(); }
+});
+cv.addEventListener("pointerup", () => {
+  if (!drag) return;
+  const { a, b } = drag; drag = null;
+  ctx.clearRect(0, 0, cv.width, cv.height);
+  if (Math.abs(a.x - b.x) + Math.abs(a.y - b.y) < 2) return;
+  cmd({ aktion: "neu", art: mode, x0: clamp(a.x, S.breite).toFixed(1), y0: clamp(a.y, S.hoehe).toFixed(1), x1: clamp(b.x, S.breite).toFixed(1), y1: clamp(b.y, S.hoehe).toFixed(1) });
+});
+img.addEventListener("error", () => setTimeout(() => { img.src = "stream.mjpg?" + Date.now(); }, 2000));
+
+// ---------- showing the state
+function put(el, v) {
+  if (el === document.activeElement) return;
+  if (el.type === "checkbox") el.checked = !!v;
+  else if (el.type === "radio") el.checked = el.value === v;
+  else if (String(el.value) !== String(v)) el.value = v;
+}
+function render(d) {
+  S = d;
+  const u = d.einheit;
+  $("v_max").textContent = fmt(d.werte.max, u); $("v_min").textContent = fmt(d.werte.min, u);
+  $("v_mitte").textContent = fmt(d.werte.mitte, u); $("v_mittel").textContent = fmt(d.werte.mittel, u);
+  $("info").textContent = d.zeit + " · " + d.quelle + " · " + d.breite + "×" + d.hoehe + " Pixel";
+  // palettes / materials once
+  if (!$("s_palette").options.length) d.paletten.forEach((n, i) => $("s_palette").add(new Option(n, i)));
+  if (!$("s_material").options.length) {
+    $("s_material").add(new Option("Material wählen …", ""));
+    d.materialien.forEach(([n, e]) => $("s_material").add(new Option(n + " (" + e.toFixed(2).replace(".", ",") + ")", e)));
+  }
+  const v = d.einstellungen;
+  document.querySelectorAll("[data-key]").forEach(el => { if (el.dataset.key in v) put(el, v[el.dataset.key]); });
+  // buttons
+  const a = d.aufnahme;
+  const tog = (id, on, txtOn, txtOff) => { const b = $(id); b.classList.toggle("on", on); if (txtOn) b.textContent = on ? txtOn : txtOff; };
+  tog("b_video", a.video, "⏹ Video", "⏺ Video"); tog("b_video2", a.video, "Video beenden", "Video starten");
+  tog("b_intervall", a.intervall, "⏹ Intervall (" + a.intervall_zaehler + ")", "⏱ Intervall");
+  tog("b_intervall2", a.intervall, "Intervall stoppen (" + a.intervall_zaehler + " Fotos)", "Intervall starten");
+  tog("b_rohdaten", a.rohdaten, "Rohdaten-Aufzeichnung beenden", "Rohdaten aufzeichnen");
+  tog("b_protokoll", a.protokoll, "Protokoll beenden", "Protokoll starten");
+  tog("b_standbild", v.standbild, "▶ Live", "⏸ Standbild");
+  renderTools(d);
+  $("events").innerHTML = "";
+  d.ereignisse.forEach(e => { const div = document.createElement("div"); div.textContent = e; if (e.includes("⚠")) div.className = "w"; $("events").append(div); });
+}
+function renderTools(d) {
+  const box = $("tools");
+  const ids = d.werkzeuge.map(t => String(t.id));
+  [...box.children].forEach(c => { if (!ids.includes(c.dataset.id)) c.remove(); });
+  d.werkzeuge.forEach(t => {
+    let c = box.querySelector('[data-id="' + t.id + '"]');
+    if (!c) {
+      c = document.createElement("div"); c.className = "card tool"; c.dataset.id = t.id;
+      const metrics = t.art === "Punkt" ? "" :
+        '<div class="row">Anzeige/Verlauf: ' + ["Max", "Mittel", "Min"].map((m, i) => '<label><input type="checkbox" data-f="metrik' + i + '"> ' + m + '</label>').join(" ") + '</div>';
+      c.innerHTML =
+        '<div class="top"><input type="text" data-f="name" maxlength="12"><span class="muted kind"></span><span class="val"></span><button data-del title="Löschen">🗑</button></div>' +
+        '<div class="sub"></div>' + metrics +
+        '<div class="row"><label><input type="checkbox" data-f="verlauf"> im Verlauf</label></div>' +
+        '<div class="row"><label><input type="checkbox" data-f="hi_an"> Alarm über</label><input type="number" step="0.5" data-f="hi"> <label><input type="checkbox" data-f="lo_an"> unter</label><input type="number" step="0.5" data-f="lo"></div>';
+      c.querySelectorAll("[data-f]").forEach(el => el.addEventListener("change", () => {
+        cmd({ aktion: "werkzeug", id: t.id, feld: el.dataset.f, wert: el.type === "checkbox" ? (el.checked ? "1" : "0") : el.value });
+      }));
+      c.querySelector("[data-del]").addEventListener("click", () => cmd({ aktion: "loeschen", id: t.id }));
+      box.append(c);
+    }
+    c.style.borderColor = t.farbe;
+    c.querySelector(".kind").textContent = t.art;
+    const val = c.querySelector(".val"); val.textContent = t.wert; val.classList.toggle("alarm", t.alarm);
+    c.querySelector(".sub").textContent = t.details;
+    const f = { name: t.name, verlauf: t.verlauf, hi_an: t.hi_an, hi: t.hi, lo_an: t.lo_an, lo: t.lo, metrik0: t.metriken[0], metrik1: t.metriken[1], metrik2: t.metriken[2] };
+    c.querySelectorAll("[data-f]").forEach(el => put(el, f[el.dataset.f]));
+  });
+}
+
+async function poll() {
+  try {
+    const r = await fetch("api/zustand", { cache: "no-store" });
+    if (r.status === 401) return showLogin();
+    if (r.status === 403) {
+      showLogin(); $("logintext").textContent = "Die Fernsteuerung ist im Programm nicht freigegeben. Dort unter „Aufnahme → Netzwerk-Stream“ ein Passwort setzen."; return;
+    }
+    const d = await r.json();
+    if (!d.zeit) return;
+    if ($("app").classList.contains("hidden")) { $("login").classList.add("hidden"); $("app").classList.remove("hidden"); $("logout").classList.remove("hidden"); }
+    render(d);
+    $("state").textContent = "verbunden"; $("state").className = "ok";
+  } catch (e) { $("state").textContent = "keine Verbindung"; $("state").className = ""; }
+}
+let timer = null;
+function start() { poll(); if (!timer) timer = setInterval(poll, 1000); }
+start();
+</script>
+</body>
+</html>

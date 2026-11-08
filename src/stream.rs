@@ -4,11 +4,14 @@
 //! - `/stream.mjpg` live picture as MJPEG (browser, VLC, OBS, …)
 //! - `/bild.jpg`    the current picture as one JPEG
 //! - `/werte.json`  the current measured values
+//! - `/steuerung`   remote control page (only with a password set in the app):
+//!   `/api/login`, `/api/logout`, `/api/zustand` (settings), `/api/befehl` (commands)
 //!
 //! Uses only the standard library: one thread accepts connections, every client gets
 //! its own thread that waits for new pictures.
 
-use std::io::{BufRead, BufReader, Write};
+use std::collections::{HashMap, HashSet};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -20,6 +23,26 @@ struct Latest {
     seq: u64,
     jpeg: Arc<Vec<u8>>,
     json: Arc<String>,
+    /// settings for the control page
+    state: Arc<String>,
+}
+
+/// A command from the control page, e.g. `aktion=set&key=emissivity&value=0.9`.
+pub struct Command {
+    pub action: String,
+    pub params: HashMap<String, String>,
+}
+
+impl Command {
+    pub fn get(&self, k: &str) -> Option<&str> {
+        self.params.get(k).map(|s| s.as_str())
+    }
+    pub fn num(&self, k: &str) -> Option<f32> {
+        self.get(k).and_then(|v| v.replace(',', ".").parse::<f32>().ok()).filter(|v| v.is_finite())
+    }
+    pub fn flag(&self, k: &str) -> Option<bool> {
+        self.get(k).map(|v| v == "1" || v == "true")
+    }
 }
 
 struct Shared {
@@ -28,6 +51,12 @@ struct Shared {
     stop: AtomicBool,
     /// clients currently receiving the MJPEG stream
     viewers: AtomicUsize,
+    /// remote control is only possible while a password is set
+    password: Mutex<Option<String>>,
+    sessions: Mutex<HashSet<String>>,
+    failed_logins: AtomicUsize,
+    commands: Mutex<Vec<Command>>,
+    ctx: eframe::egui::Context,
 }
 
 pub struct StreamServer {
@@ -39,7 +68,7 @@ pub struct StreamServer {
 
 impl StreamServer {
     /// `network = false` listens on this computer only (127.0.0.1).
-    pub fn start(port: u16, network: bool) -> Result<Self, String> {
+    pub fn start(port: u16, network: bool, ctx: eframe::egui::Context) -> Result<Self, String> {
         let ip = if network { IpAddr::V4(Ipv4Addr::UNSPECIFIED) } else { IpAddr::V4(Ipv4Addr::LOCALHOST) };
         let listener = TcpListener::bind(SocketAddr::new(ip, port)).map_err(|e| {
             if e.kind() == std::io::ErrorKind::AddrInUse {
@@ -54,6 +83,11 @@ impl StreamServer {
             cond: Condvar::new(),
             stop: AtomicBool::new(false),
             viewers: AtomicUsize::new(0),
+            password: Mutex::new(None),
+            sessions: Mutex::new(HashSet::new()),
+            failed_logins: AtomicUsize::new(0),
+            commands: Mutex::new(Vec::new()),
+            ctx,
         });
         let sh = shared.clone();
         let thread = std::thread::Builder::new()
@@ -89,6 +123,29 @@ impl StreamServer {
         l.json = Arc::new(json);
         drop(l);
         self.shared.cond.notify_all();
+    }
+
+    /// Sets or removes the control password; a changed password logs everybody out.
+    pub fn set_password(&self, pw: Option<String>) {
+        let mut cur = self.shared.password.lock().unwrap();
+        if *cur != pw {
+            *cur = pw;
+            self.shared.sessions.lock().unwrap().clear();
+            self.shared.failed_logins.store(0, Ordering::Relaxed);
+        }
+    }
+
+    /// Number of logged-in control pages.
+    pub fn sessions(&self) -> usize {
+        self.shared.sessions.lock().unwrap().len()
+    }
+
+    pub fn publish_state(&self, json: String) {
+        self.shared.latest.lock().unwrap().state = Arc::new(json);
+    }
+
+    pub fn take_commands(&self) -> Vec<Command> {
+        std::mem::take(&mut *self.shared.commands.lock().unwrap())
     }
 
     /// Only the values (when nobody watches the picture, it need not be encoded).
@@ -133,41 +190,160 @@ fn handle(mut sock: TcpStream, sh: &Shared) -> std::io::Result<()> {
     let mut reader = BufReader::new(sock.try_clone()?);
     let mut first = String::new();
     reader.read_line(&mut first)?;
-    // skip the header lines
+    let mut headers: HashMap<String, String> = HashMap::new();
     loop {
         let mut l = String::new();
         if reader.read_line(&mut l)? == 0 || l == "\r\n" || l == "\n" {
             break;
         }
+        if let Some((k, v)) = l.split_once(':') {
+            headers.insert(k.trim().to_ascii_lowercase(), v.trim().to_string());
+        }
+        if headers.len() > 64 {
+            break;
+        }
     }
     let mut parts = first.split_whitespace();
     let method = parts.next().unwrap_or("");
-    let path = parts.next().unwrap_or("/").split('?').next().unwrap_or("/");
-    if method != "GET" && method != "HEAD" {
-        return respond(&mut sock, "405 Method Not Allowed", "text/plain; charset=utf-8", b"nur GET");
+    let path = parts.next().unwrap_or("/").split('?').next().unwrap_or("/").to_string();
+    let len: usize = headers.get("content-length").and_then(|v| v.parse().ok()).unwrap_or(0);
+    if len > 8192 {
+        return respond(&mut sock, "413 Payload Too Large", "text/plain; charset=utf-8", b"zu gross");
     }
-    match path {
-        "/" | "/index.html" => respond(&mut sock, "200 OK", "text/html; charset=utf-8", PAGE.as_bytes()),
-        "/werte.json" => {
+    let mut body = vec![0u8; len];
+    if len > 0 {
+        reader.read_exact(&mut body)?;
+    }
+    let text = "text/plain; charset=utf-8";
+    let json = "application/json; charset=utf-8";
+    match (method, path.as_str()) {
+        ("GET", "/") | ("GET", "/index.html") => respond(&mut sock, "200 OK", "text/html; charset=utf-8", PAGE.as_bytes()),
+        ("GET", "/steuerung") => respond(&mut sock, "200 OK", "text/html; charset=utf-8", CONTROL_PAGE.as_bytes()),
+        ("GET", "/werte.json") => {
             let j = sh.latest.lock().unwrap().json.clone();
             let body: &[u8] = if j.is_empty() { b"{}" } else { j.as_bytes() };
-            respond(&mut sock, "200 OK", "application/json; charset=utf-8", body)
+            respond(&mut sock, "200 OK", json, body)
         }
-        "/bild.jpg" => {
-            let j = wait_first(sh);
-            match j {
-                Some(j) => respond(&mut sock, "200 OK", "image/jpeg", &j),
-                None => respond(&mut sock, "503 Service Unavailable", "text/plain; charset=utf-8", b"noch kein Bild"),
-            }
-        }
-        "/stream.mjpg" => {
+        ("GET", "/bild.jpg") => match wait_first(sh) {
+            Some(j) => respond(&mut sock, "200 OK", "image/jpeg", &j),
+            None => respond(&mut sock, "503 Service Unavailable", text, b"noch kein Bild"),
+        },
+        ("GET", "/stream.mjpg") => {
             sh.viewers.fetch_add(1, Ordering::Relaxed);
             let r = mjpeg(&mut sock, sh);
             sh.viewers.fetch_sub(1, Ordering::Relaxed);
             r
         }
-        _ => respond(&mut sock, "404 Not Found", "text/plain; charset=utf-8", b"nicht gefunden"),
+        ("POST", "/api/login") => {
+            let Some(pw) = sh.password.lock().unwrap().clone() else {
+                return respond(&mut sock, "403 Forbidden", json, br#"{"fehler":"Fernsteuerung ist im Programm nicht freigegeben"}"#);
+            };
+            // slow down guessing after a few wrong tries
+            let fails = sh.failed_logins.load(Ordering::Relaxed);
+            if fails >= 5 {
+                std::thread::sleep(Duration::from_secs(2));
+            }
+            let form = parse_form(&body);
+            let given = form.get("passwort").cloned().unwrap_or_default();
+            if same(given.as_bytes(), pw.as_bytes()) {
+                sh.failed_logins.store(0, Ordering::Relaxed);
+                let token = new_token();
+                sh.sessions.lock().unwrap().insert(token.clone());
+                let hdr = format!("wbs={token}; HttpOnly; SameSite=Strict; Path=/");
+                respond_with(&mut sock, "200 OK", json, &[("Set-Cookie", &hdr)], br#"{"ok":true}"#)
+            } else {
+                sh.failed_logins.fetch_add(1, Ordering::Relaxed);
+                respond(&mut sock, "401 Unauthorized", json, br#"{"fehler":"Passwort falsch"}"#)
+            }
+        }
+        ("POST", "/api/logout") => {
+            if let Some(t) = session_of(&headers) {
+                sh.sessions.lock().unwrap().remove(&t);
+            }
+            respond_with(&mut sock, "200 OK", json, &[("Set-Cookie", "wbs=; Max-Age=0; Path=/")], br#"{"ok":true}"#)
+        }
+        ("GET", "/api/zustand") | ("POST", "/api/befehl") => {
+            if sh.password.lock().unwrap().is_none() {
+                return respond(&mut sock, "403 Forbidden", json, br#"{"fehler":"Fernsteuerung ist im Programm nicht freigegeben"}"#);
+            }
+            let ok = session_of(&headers).map(|t| sh.sessions.lock().unwrap().contains(&t)).unwrap_or(false);
+            if !ok {
+                return respond(&mut sock, "401 Unauthorized", json, br#"{"fehler":"bitte anmelden"}"#);
+            }
+            if method == "GET" {
+                let st = sh.latest.lock().unwrap().state.clone();
+                let body: &[u8] = if st.is_empty() { b"{}" } else { st.as_bytes() };
+                return respond(&mut sock, "200 OK", json, body);
+            }
+            // a custom header cannot be sent by other web sites (no CORS), so this blocks forged requests
+            if headers.get("x-wbs").map(|v| v.as_str()) != Some("1") {
+                return respond(&mut sock, "403 Forbidden", json, br#"{"fehler":"ungueltige Anfrage"}"#);
+            }
+            let mut form = parse_form(&body);
+            let action = form.remove("aktion").unwrap_or_default();
+            if action.is_empty() {
+                return respond(&mut sock, "400 Bad Request", json, br#"{"fehler":"aktion fehlt"}"#);
+            }
+            sh.commands.lock().unwrap().push(Command { action, params: form });
+            sh.ctx.request_repaint();
+            respond(&mut sock, "200 OK", json, br#"{"ok":true}"#)
+        }
+        ("GET", _) | ("HEAD", _) => respond(&mut sock, "404 Not Found", text, b"nicht gefunden"),
+        _ => respond(&mut sock, "405 Method Not Allowed", text, b"nicht erlaubt"),
     }
+}
+
+fn session_of(headers: &HashMap<String, String>) -> Option<String> {
+    headers.get("cookie")?.split(';').find_map(|c| c.trim().strip_prefix("wbs=").map(|v| v.to_string())).filter(|v| !v.is_empty())
+}
+
+/// Compares without leaking where the first difference is.
+fn same(a: &[u8], b: &[u8]) -> bool {
+    let mut d = (a.len() ^ b.len()) as u8 | ((a.len() ^ b.len()) >> 8) as u8;
+    for i in 0..a.len().max(b.len()) {
+        d |= a.get(i).copied().unwrap_or(0) ^ b.get(i).copied().unwrap_or(0);
+    }
+    d == 0
+}
+
+fn new_token() -> String {
+    let mut b = [0u8; 24];
+    getrandom::getrandom(&mut b).expect("Zufallszahlen");
+    b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
+/// `a=1&b=x%20y` → map (URL decoding with `+` as space).
+fn parse_form(body: &[u8]) -> HashMap<String, String> {
+    let dec = |s: &str| {
+        let b = s.as_bytes();
+        let mut out = Vec::with_capacity(b.len());
+        let mut i = 0;
+        while i < b.len() {
+            match b[i] {
+                b'+' => out.push(b' '),
+                b'%' if i + 2 < b.len() => {
+                    match u8::from_str_radix(std::str::from_utf8(&b[i + 1..i + 3]).unwrap_or("zz"), 16) {
+                        Ok(v) => {
+                            out.push(v);
+                            i += 2;
+                        }
+                        Err(_) => out.push(b'%'),
+                    }
+                }
+                c => out.push(c),
+            }
+            i += 1;
+        }
+        String::from_utf8_lossy(&out).to_string()
+    };
+    String::from_utf8_lossy(body)
+        .split('&')
+        .filter(|p| !p.is_empty())
+        .map(|p| match p.split_once('=') {
+            Some((k, v)) => (dec(k), dec(v)),
+            None => (dec(p), String::new()),
+        })
+        .collect()
 }
 
 /// The current picture; waits up to 3 s for the first one (the app only encodes
@@ -187,11 +363,19 @@ fn wait_first(sh: &Shared) -> Option<Arc<Vec<u8>>> {
 }
 
 fn respond(sock: &mut TcpStream, status: &str, ctype: &str, body: &[u8]) -> std::io::Result<()> {
-    write!(
-        sock,
-        "HTTP/1.1 {status}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
+    respond_with(sock, status, ctype, &[], body)
+}
+
+fn respond_with(sock: &mut TcpStream, status: &str, ctype: &str, extra: &[(&str, &str)], body: &[u8]) -> std::io::Result<()> {
+    let mut hdr = format!(
+        "HTTP/1.1 {status}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nConnection: close\r\n",
         body.len()
-    )?;
+    );
+    for (k, v) in extra {
+        hdr.push_str(&format!("{k}: {v}\r\n"));
+    }
+    hdr.push_str("\r\n");
+    sock.write_all(hdr.as_bytes())?;
     sock.write_all(body)?;
     sock.flush()
 }
@@ -250,6 +434,8 @@ pub fn json_num(v: f32) -> String {
     }
 }
 
+const CONTROL_PAGE: &str = include_str!("control.html");
+
 const PAGE: &str = r##"<!doctype html>
 <html lang="de">
 <head>
@@ -296,6 +482,7 @@ const PAGE: &str = r##"<!doctype html>
       <div id="info">–</div>
       <div style="margin-top:6px"><a href="bild.jpg" download>Einzelbild speichern</a> · <a href="werte.json">Werte (JSON)</a></div>
       <div style="margin-top:6px">Stream für VLC/OBS: <code id="surl"></code></div>
+      <div style="margin-top:6px"><a href="steuerung">Steuerung (mit Passwort)</a></div>
     </div>
   </div>
 </main>
@@ -340,7 +527,7 @@ mod tests {
     #[test]
     fn serves_page_values_and_stream() {
         let port = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
-        let srv = StreamServer::start(port, false).unwrap();
+        let srv = StreamServer::start(port, false, eframe::egui::Context::default()).unwrap();
         srv.publish(vec![0xFF, 0xD8, 1, 2, 3, 0xFF, 0xD9], "{\"zeit\":\"x\"}".into());
         let get = |p: &str| {
             let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
@@ -367,6 +554,47 @@ mod tests {
         }
         assert!(String::from_utf8_lossy(&got).contains("multipart/x-mixed-replace"));
         assert_eq!(srv.viewers(), 1);
+    }
+
+    #[test]
+    fn control_needs_password_and_session() {
+        let port = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let srv = StreamServer::start(port, false, eframe::egui::Context::default()).unwrap();
+        let req = |raw: String| {
+            let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+            s.write_all(raw.as_bytes()).unwrap();
+            let mut out = Vec::new();
+            s.read_to_end(&mut out).unwrap();
+            String::from_utf8_lossy(&out).to_string()
+        };
+        let post = |path: &str, body: &str, cookie: &str| {
+            req(format!(
+                "POST {path} HTTP/1.1\r\nContent-Length: {}\r\nX-WBS: 1\r\nCookie: {cookie}\r\n\r\n{body}",
+                body.len()
+            ))
+        };
+        // no password set: control is off
+        assert!(post("/api/login", "passwort=x", "").starts_with("HTTP/1.1 403"));
+        srv.set_password(Some("geheim 1".into()));
+        assert!(post("/api/login", "passwort=falsch", "").starts_with("HTTP/1.1 401"));
+        assert!(req("GET /api/zustand HTTP/1.1\r\n\r\n".into()).starts_with("HTTP/1.1 401"));
+        let ok = post("/api/login", "passwort=geheim+1", "");
+        assert!(ok.starts_with("HTTP/1.1 200"), "{ok}");
+        let tok = ok.split("wbs=").nth(1).unwrap().split(';').next().unwrap().to_string();
+        let cookie = format!("wbs={tok}");
+        srv.publish_state("{\"a\":1}".into());
+        assert!(req(format!("GET /api/zustand HTTP/1.1\r\nCookie: {cookie}\r\n\r\n")).ends_with("{\"a\":1}"));
+        // command without the custom header is refused
+        let no_hdr = req(format!("POST /api/befehl HTTP/1.1\r\nContent-Length: 9\r\nCookie: {cookie}\r\n\r\naktion=xy"));
+        assert!(no_hdr.starts_with("HTTP/1.1 403"));
+        assert!(post("/api/befehl", "aktion=set&key=emissivity&value=0%2C9", &cookie).starts_with("HTTP/1.1 200"));
+        let cmds = srv.take_commands();
+        assert_eq!(cmds.len(), 1);
+        assert_eq!(cmds[0].action, "set");
+        assert_eq!(cmds[0].num("value"), Some(0.9));
+        // a new password logs everybody out
+        srv.set_password(Some("anders".into()));
+        assert!(req(format!("GET /api/zustand HTTP/1.1\r\nCookie: {cookie}\r\n\r\n")).starts_with("HTTP/1.1 401"));
     }
 
     #[test]
