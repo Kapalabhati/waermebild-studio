@@ -6,6 +6,7 @@ mod chart;
 mod overlay;
 mod record;
 mod sim;
+mod stream;
 mod thermal;
 mod usbcam;
 

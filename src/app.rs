@@ -8,6 +8,7 @@ use crate::record::{
 };
 use crate::overlay::{annotate, font_px, Anchor, Annotations, ColorScale, Label};
 use crate::sim::DemoScene;
+use crate::stream::{json_num, json_str, StreamServer};
 use crate::thermal::*;
 use eframe::egui::{
     self, Align, Align2, Color32, ColorImage, CornerRadius, FontId, Layout, Pos2, Rect, RichText, Sense, Stroke,
@@ -260,6 +261,12 @@ pub struct ThermoApp {
     analysis_threshold: f32,
 
     csv_import: Option<CsvImport>,
+    stream: Option<StreamServer>,
+    stream_port: u16,
+    stream_network: bool,
+    stream_fps: f32,
+    stream_scale: u32,
+    stream_last: Option<Instant>,
     file_origin: Option<chrono::DateTime<chrono::Local>>,
     curve_for: Option<String>,
 
@@ -371,6 +378,12 @@ impl ThermoApp {
             analysis_region: None,
             analysis_threshold: 40.0,
             csv_import: None,
+            stream: None,
+            stream_port: 8080,
+            stream_network: true,
+            stream_fps: 10.0,
+            stream_scale: 2,
+            stream_last: None,
             file_origin: None,
             curve_for: None,
             screenshot,
@@ -388,6 +401,12 @@ impl ThermoApp {
         app.add_demo_tools();
         app.prefill_demo_history(90.0);
         app.log("Programm gestartet");
+        // WBS_STREAM=<port>: start the network stream on this PC only (manual test)
+        if let Some(port) = std::env::var("WBS_STREAM").ok().and_then(|v| v.parse().ok()) {
+            app.stream_port = port;
+            app.stream_network = false;
+            app.toggle_stream();
+        }
         app
     }
 
@@ -1143,6 +1162,97 @@ impl ThermoApp {
         annotate(base, px, &Annotations { labels, scale: scale_info, info })
     }
 
+    // ------------------------------------------------------------ network stream
+
+    fn toggle_stream(&mut self) {
+        if self.stream.take().is_some() {
+            self.log("Netzwerk-Stream beendet");
+            return;
+        }
+        match StreamServer::start(self.stream_port, self.stream_network) {
+            Ok(s) => {
+                let url = s.urls().first().cloned().unwrap_or_default();
+                self.log(format!("Netzwerk-Stream gestartet: {url}"));
+                self.stream = Some(s);
+                self.stream_last = None;
+            }
+            Err(e) => self.log(format!("Netzwerk-Stream fehlgeschlagen: {e}")),
+        }
+    }
+
+    /// Current values for the web page (/werte.json).
+    fn stream_json(&self) -> String {
+        let u = self.unit;
+        let n = |c: f32| json_num(u.from_c(c));
+        let mut tools = Vec::new();
+        for t in &self.tools {
+            let vals: Vec<String> = match t.shape {
+                Shape::Spot { .. } => vec![format!("\"Wert\":{}", n(t.reading.value))],
+                _ => Metric::ALL
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| t.metrics[*i])
+                    .map(|(_, m)| format!("{}:{}", json_str(m.short()), n(metric_value(*m, &t.reading))))
+                    .collect(),
+            };
+            let c = t.color;
+            tools.push(format!(
+                "{{\"name\":{},\"art\":{},\"farbe\":\"#{:02x}{:02x}{:02x}\",\"alarm\":{},\"werte\":{{{}}}}}",
+                json_str(&t.name),
+                json_str(t.kind_name()),
+                c.r(),
+                c.g(),
+                c.b(),
+                t.in_alarm,
+                vals.join(",")
+            ));
+        }
+        let quelle = match &self.source {
+            Source::Camera(name) => format!("Live: {name}"),
+            Source::Demo(_) => "Demo".to_string(),
+            Source::Playback(pb) => format!("Datei: {}", pb.name),
+            Source::None => "keine Quelle".to_string(),
+        };
+        format!(
+            "{{\"zeit\":{},\"einheit\":{},\"max\":{},\"min\":{},\"mitte\":{},\"mittel\":{},\"emission\":{},\"quelle\":{},\"werkzeuge\":[{}]}}",
+            json_str(&chrono::Local::now().format("%d.%m.%Y %H:%M:%S").to_string()),
+            json_str(u.label()),
+            n(self.stats.max),
+            n(self.stats.min),
+            n(self.stats.center),
+            n(self.stats.mean),
+            json_num(self.emission.emissivity),
+            json_str(&quelle),
+            tools.join(",")
+        )
+    }
+
+    /// Sends the current picture (only when someone watches) and values, at most `stream_fps` times a second.
+    fn stream_tick(&mut self) {
+        let Some(srv) = &self.stream else { return };
+        if self.frame.is_none() {
+            return;
+        }
+        let every = Duration::from_secs_f32(1.0 / self.stream_fps.max(0.5));
+        if self.stream_last.map(|t| t.elapsed() < every).unwrap_or(false) {
+            return;
+        }
+        self.stream_last = Some(Instant::now());
+        let json = self.stream_json();
+        if srv.viewers() == 0 {
+            srv.publish_values(json);
+            return;
+        }
+        let img = self.render_capture(self.stream_scale, true);
+        let mut jpg = Vec::new();
+        let enc = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpg, 85);
+        if img.write_with_encoder(enc).is_ok() {
+            if let Some(srv) = &self.stream {
+                srv.publish(jpg, json);
+            }
+        }
+    }
+
     fn capture_tick(&mut self) {
         // video
         if self.video.is_some() {
@@ -1435,6 +1545,9 @@ impl ThermoApp {
                     self.show_analysis = !self.show_analysis;
                 }
                 ui.separator();
+                if rec_button(ui, "📡 Stream", self.stream.is_some(), "Live-Bild und Messwerte im Netzwerk freigeben (Browser, VLC, OBS)").clicked() {
+                    self.toggle_stream();
+                }
                 if rec_button(ui, "📝 Protokoll", self.logger.is_some(), "Temperaturverlauf als CSV mitschreiben").clicked() {
                     self.toggle_logger();
                 }
@@ -2232,6 +2345,44 @@ impl ThermoApp {
         }
         ui.label(RichText::new("Format: AVI (Motion-JPEG), läuft in den meisten Playern.").small().color(MUTED));
 
+        section(ui, "📡 Netzwerk-Stream");
+        ui.add_enabled_ui(self.stream.is_none(), |ui| {
+            ui.horizontal(|ui| {
+                ui.radio_value(&mut self.stream_network, true, "im Netzwerk");
+                ui.radio_value(&mut self.stream_network, false, "nur dieser PC");
+                ui.label("Port");
+                ui.add(egui::DragValue::new(&mut self.stream_port).range(1024..=65535).speed(1.0));
+            });
+        });
+        ui.horizontal(|ui| {
+            ui.label("Größe");
+            for s in [1u32, 2, 3] {
+                ui.selectable_value(&mut self.stream_scale, s, format!("{}×", s));
+            }
+            ui.label("Bilder/s");
+            egui::ComboBox::from_id_salt("stream_fps").width(50.0).selected_text(fmt_num(self.stream_fps, 0)).show_ui(ui, |ui| {
+                for f in [2.0f32, 5.0, 10.0, 15.0, 25.0] {
+                    ui.selectable_value(&mut self.stream_fps, f, fmt_num(f, 0));
+                }
+            });
+        });
+        let st = if let Some(s) = &self.stream { format!("⏹ Stream beenden ({} Zuschauer)", s.viewers()) } else { "📡 Stream starten".into() };
+        if ui.add(big_button(&st, self.stream.is_some())).clicked() {
+            self.toggle_stream();
+        }
+        if let Some(s) = &self.stream {
+            ui.label(RichText::new("Im Browser öffnen:").small());
+            for u in s.urls() {
+                ui.hyperlink_to(RichText::new(&u).monospace(), &u);
+            }
+            ui.label(RichText::new(format!("Für VLC/OBS: {}stream.mjpg", s.urls()[0])).small().color(MUTED));
+        }
+        ui.label(
+            RichText::new("Zeigt Live-Bild mit Beschriftung und die Messwerte auf einer Webseite. „Im Netzwerk“: jedes Gerät im selben Netz kann zusehen (ohne Passwort) – nur in vertrauenswürdigen Netzen nutzen. Beim ersten Start fragt die Windows-Firewall nach.")
+                .small()
+                .color(MUTED),
+        );
+
         section(ui, "💾 Rohdaten-Aufzeichnung");
         let rt = if let Some(r) = &self.raw_rec { format!("⏹ Stoppen ({} Bilder, {})", r.frames, fmt_bytes(r.bytes())) } else { "💾 Rohdaten aufzeichnen".into() };
         if ui.add(big_button(&rt, self.raw_rec.is_some())).clicked() {
@@ -2358,6 +2509,10 @@ impl ThermoApp {
             ui.label(RichText::new(format!("{}×{} Pixel", w, h)).color(MUTED));
             ui.label(RichText::new(format!("{} Bilder/s", self.frame_times.len())).color(MUTED));
             ui.label(RichText::new(format!("ε {}", fmt_num(self.emission.emissivity, 2))).color(MUTED));
+            if let Some(s) = &self.stream {
+                ui.separator();
+                ui.label(RichText::new(format!("📡 Stream: {} Zuschauer", s.viewers())).color(ACCENT));
+            }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 ui.label(RichText::new(format!("Speicherort: {}", self.out_dir.display())).color(MUTED).small());
             });
@@ -2932,6 +3087,10 @@ impl eframe::App for ThermoApp {
         if !matches!(self.source, Source::None) || self.interval.active {
             ctx.request_repaint_after(Duration::from_millis(30));
         }
+        if self.stream.is_some() {
+            self.stream_tick();
+            ctx.request_repaint_after(Duration::from_secs_f32(1.0 / self.stream_fps.max(0.5)));
+        }
 
         // --screenshot: draw ~120 frames, save the window picture, exit
         if let Some(path) = self.screenshot.clone() {
@@ -3001,6 +3160,7 @@ impl eframe::App for ThermoApp {
     }
 
     fn on_exit(&mut self) {
+        self.stream = None;
         self.stop_video();
         self.stop_raw_recording("beendet");
         if let Some((l, _)) = self.logger.take() {

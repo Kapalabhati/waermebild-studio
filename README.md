@@ -31,6 +31,13 @@ Aufnahmen später neu aus. Die Oberfläche ist auf Deutsch.
 - Rohdaten-Aufzeichnung (`.tcraw`) und Temperatur-Tabelle pro Bild (`.csv`)
 - fortlaufendes Temperatur-Protokoll als CSV
 
+**Netzwerk-Stream**
+- eingebauter Webserver: Live-Bild mit Beschriftung und aktuelle Messwerte im Browser,
+  auf jedem Gerät im selben Netz (oder nur auf diesem PC)
+- `/stream.mjpg` für VLC oder OBS, `/bild.jpg` als Einzelbild, `/werte.json` für eigene Auswertungen
+- Port, Bildgröße und Bilder pro Sekunde einstellbar; ohne Passwort, daher nur in
+  vertrauenswürdigen Netzen verwenden
+
 **Auswerten**
 - Fotos, Rohdaten-Aufnahmen, ganze Intervall-Serien und CSV-Tabellen öffnen
   (auch per Ziehen ins Fenster)
