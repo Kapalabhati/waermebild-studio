@@ -43,6 +43,15 @@ Aufnahmen später neu aus. Die Oberfläche ist auf Deutsch.
   und Protokoll starten. Die Übertragung ist unverschlüsseltes HTTP; das Passwort wird nicht
   gespeichert
 
+**CAN-Bus**
+- Messwerte zyklisch auf den CAN-Bus senden (PEAK PCAN-USB, benötigt den PEAK-Treiber
+  mit PCAN-Basic), z. B. um sie synchron mit Fahrzeug-Messdaten aufzuzeichnen
+- Kanal, Baudrate (5 kBit/s – 1 MBit/s), Basis-ID, Standard-/Extended-ID und Zykluszeit einstellbar
+- Belegung: je Botschaft vier Werte, signed 16 Bit, Intel, Faktor 0,1 °C; zuerst Max/Min/Mitte/
+  Mittel des Bildes, dann jedes Messwerkzeug (Bereiche und Linien mit Max, Mittel, Min);
+  `0x8000` = kein Wert
+- Export der passenden DBC-Datei
+
 **Auswerten**
 - Fotos, Rohdaten-Aufnahmen, ganze Intervall-Serien und CSV-Tabellen öffnen
   (auch per Ziehen ins Fenster)

@@ -1,6 +1,7 @@
 //! The main window.
 
 use crate::camera::{CamCmd, CamMsg, CameraWorker, DemoSource, DeviceInfo};
+use crate::can::{self, CanConfig, CanSender, Message, Signal};
 use crate::chart::{draw_chart, History};
 use crate::record::{
     open_folder, render_rgb, save_matrix_csv, save_png, save_raw_single, timestamp_name, CsvLogger, CsvStyle, Mark,
@@ -52,6 +53,7 @@ enum Tab {
     Image,
     Emission,
     Capture,
+    Can,
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -268,6 +270,14 @@ pub struct ThermoApp {
     stream_scale: u32,
     stream_last: Option<Instant>,
     remote_on: bool,
+    can: Option<CanSender>,
+    can_channel: u8,
+    can_baud: u32,
+    can_base_id: u32,
+    can_id_text: String,
+    can_extended: bool,
+    can_cycle_ms: u32,
+    can_exported: Option<String>,
     remote_pw: String,
     egui_ctx: egui::Context,
     file_origin: Option<chrono::DateTime<chrono::Local>>,
@@ -388,6 +398,14 @@ impl ThermoApp {
             stream_scale: 2,
             stream_last: None,
             remote_on: false,
+            can: None,
+            can_channel: 1,
+            can_baud: 500_000,
+            can_base_id: 0x700,
+            can_id_text: "700".into(),
+            can_extended: false,
+            can_cycle_ms: 100,
+            can_exported: None,
             remote_pw: String::new(),
             egui_ctx: ctx.clone(),
             file_origin: None,
@@ -407,6 +425,17 @@ impl ThermoApp {
         app.add_demo_tools();
         app.prefill_demo_history(90.0);
         app.log("Programm gestartet");
+        // WBS_TAB=can: open the CAN tab (screenshot test)
+        if std::env::var("WBS_TAB").map(|v| v == "can").unwrap_or(false) {
+            app.tab = Tab::Can;
+        }
+        // WBS_CAN=1: try to start the CAN output (manual test; logs the result)
+        if std::env::var_os("WBS_CAN").is_some() {
+            app.toggle_can();
+            if let Some(e) = app.events.front() {
+                eprintln!("{e}");
+            }
+        }
         // WBS_STREAM=<port>: start the network stream on this PC only (manual test)
         if let Some(port) = std::env::var("WBS_STREAM").ok().and_then(|v| v.parse().ok()) {
             if let Ok(pw) = std::env::var("WBS_REMOTE_PW") {
@@ -1170,6 +1199,218 @@ impl ThermoApp {
             [when, right, st]
         });
         annotate(base, px, &Annotations { labels, scale: scale_info, info })
+    }
+
+    // ------------------------------------------------------------ CAN bus
+
+    /// Signals in bus order with their current values (°C): Max, Min, Mitte, Mittel of
+    /// the whole picture, then every tool (points one value, areas/lines Max, Mittel, Min).
+    fn can_signals(&self) -> (Vec<Signal>, Vec<f32>) {
+        let mut used = Vec::new();
+        let mut sig = Vec::new();
+        let mut val = Vec::new();
+        let mut add = |raw: &str, comment: String, v: f32, sig: &mut Vec<Signal>, val: &mut Vec<f32>| {
+            sig.push(Signal { name: can::dbc_name(raw, &mut used), comment });
+            val.push(v);
+        };
+        add("Bild_Max", "Hoechste Temperatur im Bild".into(), self.stats.max, &mut sig, &mut val);
+        add("Bild_Min", "Niedrigste Temperatur im Bild".into(), self.stats.min, &mut sig, &mut val);
+        add("Bild_Mitte", "Temperatur in der Bildmitte".into(), self.stats.center, &mut sig, &mut val);
+        add("Bild_Mittel", "Mittelwert des ganzen Bildes".into(), self.stats.mean, &mut sig, &mut val);
+        for t in &self.tools {
+            match t.shape {
+                Shape::Spot { x, y } => add(&t.name, format!("Messpunkt {} (x {}, y {})", t.name, x as i32, y as i32), t.reading.value, &mut sig, &mut val),
+                Shape::Area { x0, y0, x1, y1 } | Shape::Line { x0, y0, x1, y1 } => {
+                    let kind = if matches!(t.shape, Shape::Area { .. }) { "Bereich" } else { "Linie" };
+                    let pos = format!("{} {} ({} {} – {} {})", kind, t.name, x0 as i32, y0 as i32, x1 as i32, y1 as i32);
+                    add(&format!("{}_Max", t.name), format!("{pos}: Maximum"), t.reading.max, &mut sig, &mut val);
+                    add(&format!("{}_Mittel", t.name), format!("{pos}: Mittelwert"), t.reading.avg, &mut sig, &mut val);
+                    add(&format!("{}_Min", t.name), format!("{pos}: Minimum"), t.reading.min, &mut sig, &mut val);
+                }
+            }
+        }
+        (sig, val)
+    }
+
+    fn can_layout(&self) -> Vec<Message> {
+        can::layout(&self.can_signals().0, self.can_base_id)
+    }
+
+    /// Identifies a layout, to warn when the exported DBC no longer matches.
+    fn can_layout_key(&self) -> String {
+        let mut k = format!("{:X}:{}:{}", self.can_base_id, self.can_extended, self.can_cycle_ms);
+        for m in self.can_layout() {
+            k.push_str(&format!("|{:X}", m.id));
+            for s in &m.signals {
+                k.push(',');
+                k.push_str(&s.name);
+            }
+        }
+        k
+    }
+
+    /// Highest ID allowed for the base ID with the current number of messages.
+    fn can_id_problem(&self) -> Option<String> {
+        let n = self.can_layout().len().max(1) as u32;
+        let max = if self.can_extended { 0x1FFF_FFFF } else { 0x7FF };
+        (self.can_base_id + n - 1 > max).then(|| format!("Basis-ID zu hoch: {} Botschaften brauchen IDs bis 0x{:X} (erlaubt bis 0x{:X})", n, self.can_base_id + n - 1, max))
+    }
+
+    fn toggle_can(&mut self) {
+        if self.can.take().is_some() {
+            self.log("CAN-Ausgabe beendet");
+            return;
+        }
+        if let Some(p) = self.can_id_problem() {
+            return self.log(p);
+        }
+        let cfg = CanConfig {
+            channel: self.can_channel,
+            baud: self.can_baud,
+            base_id: self.can_base_id,
+            extended: self.can_extended,
+            cycle_ms: self.can_cycle_ms,
+        };
+        match CanSender::start(cfg) {
+            Ok(c) => {
+                self.log(format!(
+                    "CAN-Ausgabe gestartet: PCAN-USB {}, {} kBit/s, ab ID 0x{:X}, alle {} ms",
+                    self.can_channel,
+                    self.can_baud / 1000,
+                    self.can_base_id,
+                    self.can_cycle_ms
+                ));
+                if self.can_exported.as_deref() != Some(self.can_layout_key().as_str()) {
+                    self.log("Hinweis: Die DBC-Datei passt nicht zur aktuellen Belegung – bitte neu exportieren");
+                }
+                self.can = Some(c);
+                self.can_tick();
+            }
+            Err(e) => self.log(format!("CAN-Ausgabe fehlgeschlagen: {e}")),
+        }
+    }
+
+    /// Hands the current values to the sender thread.
+    fn can_tick(&mut self) {
+        let (sig, val) = self.can_signals();
+        let msgs = can::layout(&sig, self.can_base_id);
+        if let Some(c) = &self.can {
+            c.update(&msgs, &val);
+        }
+    }
+
+    fn export_dbc(&mut self) {
+        if let Some(p) = self.can_id_problem() {
+            return self.log(p);
+        }
+        let Some(path) = rfd::FileDialog::new()
+            .set_title("DBC-Datei speichern")
+            .add_filter("CAN-Datenbank (*.dbc)", &["dbc"])
+            .set_directory(&self.out_dir)
+            .set_file_name("waermebild_studio.dbc")
+            .save_file()
+        else {
+            return;
+        };
+        let text = can::dbc(&self.can_layout(), self.can_extended, self.can_cycle_ms);
+        match std::fs::write(&path, text) {
+            Ok(()) => {
+                self.can_exported = Some(self.can_layout_key());
+                self.log(format!("DBC gespeichert: {}", path.display()));
+            }
+            Err(e) => self.log(format!("DBC speichern fehlgeschlagen: {e}")),
+        }
+    }
+
+    fn tab_can(&mut self, ui: &mut egui::Ui) {
+        section(ui, "CAN-Bus (PEAK PCAN-USB)");
+        let running = self.can.is_some();
+        ui.add_enabled_ui(!running, |ui| {
+            egui::Grid::new("can_cfg").num_columns(2).spacing([10.0, 8.0]).show(ui, |ui| {
+                ui.label("Kanal");
+                egui::ComboBox::from_id_salt("can_ch").width(130.0).selected_text(format!("PCAN-USB {}", self.can_channel)).show_ui(ui, |ui| {
+                    for c in 1..=8u8 {
+                        ui.selectable_value(&mut self.can_channel, c, format!("PCAN-USB {c}"));
+                    }
+                });
+                ui.end_row();
+                ui.label("Baudrate");
+                egui::ComboBox::from_id_salt("can_baud").width(130.0).selected_text(format!("{} kBit/s", self.can_baud / 1000)).show_ui(ui, |ui| {
+                    for (b, _) in can::BAUDRATES {
+                        ui.selectable_value(&mut self.can_baud, *b, format!("{} kBit/s", b / 1000));
+                    }
+                });
+                ui.end_row();
+                ui.label("Basis-ID (hex)");
+                ui.horizontal(|ui| {
+                    ui.label("0x");
+                    let r = ui.add(egui::TextEdit::singleline(&mut self.can_id_text).desired_width(80.0).char_limit(8));
+                    if r.changed() {
+                        if let Ok(v) = u32::from_str_radix(self.can_id_text.trim(), 16) {
+                            self.can_base_id = v;
+                        }
+                    }
+                    if r.lost_focus() {
+                        self.can_id_text = format!("{:X}", self.can_base_id);
+                    }
+                });
+                ui.end_row();
+                ui.label("ID-Format");
+                ui.checkbox(&mut self.can_extended, "Extended (29 Bit)");
+                ui.end_row();
+                ui.label("Zykluszeit");
+                ui.add(egui::DragValue::new(&mut self.can_cycle_ms).range(10..=10000).speed(1.0).suffix(" ms"));
+                ui.end_row();
+            });
+        });
+        if let Some(p) = self.can_id_problem() {
+            ui.label(RichText::new(p).small().color(REC));
+        }
+        let t = if let Some(c) = &self.can { format!("⏹ CAN-Ausgabe beenden ({} gesendet)", c.sent()) } else { "🚌 CAN-Ausgabe starten".into() };
+        if ui.add(big_button(&t, running)).clicked() {
+            self.toggle_can();
+        }
+        if let Some(c) = &self.can {
+            if c.errors() > 0 {
+                ui.label(RichText::new(format!("{} Sendefehler – zuletzt: {}", c.errors(), c.last_error())).small().color(REC));
+            }
+        }
+
+        section(ui, "Belegung");
+        let msgs = self.can_layout();
+        egui::Grid::new("can_layout").num_columns(2).striped(true).spacing([10.0, 4.0]).show(ui, |ui| {
+            for m in &msgs {
+                ui.label(RichText::new(format!("0x{:X}", m.id)).monospace().strong());
+                let names: Vec<&str> = m.signals.iter().map(|s| s.name.as_str()).collect();
+                ui.label(RichText::new(names.join(", ")).small());
+                ui.end_row();
+            }
+        });
+        ui.label(
+            RichText::new("Je Botschaft 8 Byte = 4 Werte, signed 16 Bit, Intel (Little Endian), Faktor 0,1, Einheit °C (unabhängig von der Anzeige-Einheit). 0x8000 = kein Wert. Punkte belegen einen Wert, Bereiche und Linien drei (Max, Mittel, Min). Bei Standbild werden die angehaltenen Werte weiter gesendet.")
+                .small()
+                .color(MUTED),
+        );
+
+        section(ui, "DBC-Datei");
+        let fresh = self.can_exported.as_deref() == Some(self.can_layout_key().as_str());
+        if ui.button("💾 DBC exportieren …").clicked() {
+            self.export_dbc();
+        }
+        if !fresh {
+            ui.label(
+                RichText::new(if self.can_exported.is_some() {
+                    "Belegung geändert (Messwerkzeuge, ID oder Zykluszeit) – DBC bitte neu exportieren."
+                } else {
+                    "Noch nicht exportiert."
+                })
+                .small()
+                .color(ACCENT),
+            );
+        } else {
+            ui.label(RichText::new("DBC passt zur aktuellen Belegung.").small().color(Color32::from_rgb(80, 220, 120)));
+        }
+        ui.label(RichText::new("Tipp: Messwerkzeuge erst setzen, dann DBC exportieren. Hinzufügen, Löschen oder Umbenennen verschiebt die Belegung.").small().color(MUTED));
     }
 
     // ------------------------------------------------------------ network stream
@@ -2240,11 +2481,11 @@ impl ThermoApp {
     fn side_panel(&mut self, ui: &mut egui::Ui) {
         ui.add_space(6.0);
         ui.horizontal(|ui| {
-            for (t, name) in [(Tab::Measure, "Messwerte"), (Tab::Image, "Bild"), (Tab::Emission, "Emission"), (Tab::Capture, "Aufnahme")] {
+            for (t, name) in [(Tab::Measure, "Messwerte"), (Tab::Image, "Bild"), (Tab::Emission, "Emission"), (Tab::Capture, "Aufnahme"), (Tab::Can, "CAN")] {
                 let sel = self.tab == t;
                 let b = egui::Button::new(RichText::new(name).color(if sel { Color32::BLACK } else { Color32::from_gray(210) }).strong())
                     .fill(if sel { ACCENT } else { CARD })
-                    .min_size(Vec2::new(74.0, 28.0));
+                    .min_size(Vec2::new(if t == Tab::Can { 44.0 } else { 62.0 }, 28.0));
                 if ui.add(b).clicked() {
                     self.tab = t;
                 }
@@ -2256,6 +2497,7 @@ impl ThermoApp {
             Tab::Image => self.tab_image(ui),
             Tab::Emission => self.tab_emission(ui),
             Tab::Capture => self.tab_capture(ui),
+            Tab::Can => self.tab_can(ui),
         });
     }
 
@@ -2789,6 +3031,11 @@ impl ThermoApp {
             if let Some(s) = &self.stream {
                 ui.separator();
                 ui.label(RichText::new(format!("📡 Stream: {} Zuschauer", s.viewers())).color(ACCENT));
+            }
+            if let Some(c) = &self.can {
+                ui.separator();
+                let col = if c.errors() > 0 { REC } else { ACCENT };
+                ui.label(RichText::new(format!("🚌 CAN: {} gesendet", c.sent())).color(col));
             }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 ui.label(RichText::new(format!("Speicherort: {}", self.out_dir.display())).color(MUTED).small());
@@ -3364,6 +3611,9 @@ impl eframe::App for ThermoApp {
         if !matches!(self.source, Source::None) || self.interval.active {
             ctx.request_repaint_after(Duration::from_millis(30));
         }
+        if self.can.is_some() {
+            self.can_tick();
+        }
         if self.stream.is_some() {
             self.stream_tick();
             ctx.request_repaint_after(Duration::from_secs_f32(1.0 / self.stream_fps.max(0.5)));
@@ -3403,6 +3653,12 @@ impl eframe::App for ThermoApp {
                     }
                 }
             }
+            // WBS_DBC=<file> together with --screenshot: write the DBC for the demo tools.
+            if self.frames_drawn == 108 {
+                if let Some(p) = std::env::var_os("WBS_DBC") {
+                    let _ = std::fs::write(p, can::dbc(&self.can_layout(), self.can_extended, self.can_cycle_ms));
+                }
+            }
             // WBS_EXPORT=<folder> together with --screenshot: export the chart history there.
             if self.frames_drawn == 110 {
                 if let Some(dir) = std::env::var_os("WBS_EXPORT").map(PathBuf::from) {
@@ -3437,6 +3693,7 @@ impl eframe::App for ThermoApp {
     }
 
     fn on_exit(&mut self) {
+        self.can = None;
         self.stream = None;
         self.stop_video();
         self.stop_raw_recording("beendet");
