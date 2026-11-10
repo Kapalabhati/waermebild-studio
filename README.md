@@ -20,6 +20,8 @@ Aufnahmen später neu aus. Die Oberfläche ist auf Deutsch.
 
 **Messen**
 - beliebig viele Messpunkte, Messbereiche und Messlinien, jeweils mit Alarmgrenzen
+- Messbereiche als Rechteck, Kreis oder Polygon (Auswahl per langem Klick oder Rechtsklick
+  auf das Bereichs-Symbol)
 - bei Bereichen und Linien Max, Mittel und Min einzeln oder gleichzeitig anzeigen
 - Temperaturverlauf als Kurve, Export als CSV (Datum/Uhrzeit auf die Millisekunde und
   vergangene Millisekunden)

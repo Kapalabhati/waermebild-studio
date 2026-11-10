@@ -1,6 +1,6 @@
 [package]
 name = "waermebild-studio"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 description = "Desktop-App für USB-Wärmebildkameras: Live-Bild, Messpunkte, Temperaturverlauf, Rohdaten, Foto/Intervall/Video"
 

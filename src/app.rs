@@ -91,11 +91,127 @@ impl Metric {
     }
 }
 
-#[derive(Clone, Copy, PartialEq)]
+const MAX_POLY: usize = 24;
+
+#[derive(Clone, Copy, PartialEq, Debug)]
 enum Shape {
     Spot { x: f32, y: f32 },
     Area { x0: f32, y0: f32, x1: f32, y1: f32 },
     Line { x0: f32, y0: f32, x1: f32, y1: f32 },
+    Circle { cx: f32, cy: f32, r: f32 },
+    /// polygon with `n` corners (picture coordinates of pixel centres)
+    Poly { pts: [(f32, f32); MAX_POLY], n: u8 },
+}
+
+impl Shape {
+    fn poly(points: &[(f32, f32)]) -> Shape {
+        let mut pts = [(0.0, 0.0); MAX_POLY];
+        let n = points.len().min(MAX_POLY);
+        pts[..n].copy_from_slice(&points[..n]);
+        Shape::Poly { pts, n: n as u8 }
+    }
+
+    fn corners(&self) -> &[(f32, f32)] {
+        match self {
+            Shape::Poly { pts, n } => &pts[..*n as usize],
+            _ => &[],
+        }
+    }
+
+    fn translate(&self, dx: f32, dy: f32) -> Shape {
+        match *self {
+            Shape::Spot { x, y } => Shape::Spot { x: x + dx, y: y + dy },
+            Shape::Area { x0, y0, x1, y1 } => Shape::Area { x0: x0 + dx, y0: y0 + dy, x1: x1 + dx, y1: y1 + dy },
+            Shape::Line { x0, y0, x1, y1 } => Shape::Line { x0: x0 + dx, y0: y0 + dy, x1: x1 + dx, y1: y1 + dy },
+            Shape::Circle { cx, cy, r } => Shape::Circle { cx: cx + dx, cy: cy + dy, r },
+            Shape::Poly { mut pts, n } => {
+                for p in pts.iter_mut().take(n as usize) {
+                    p.0 += dx;
+                    p.1 += dy;
+                }
+                Shape::Poly { pts, n }
+            }
+        }
+    }
+
+    /// Bounding box (x0, y0, x1, y1).
+    fn bbox(&self) -> (f32, f32, f32, f32) {
+        match *self {
+            Shape::Spot { x, y } => (x, y, x, y),
+            Shape::Area { x0, y0, x1, y1 } | Shape::Line { x0, y0, x1, y1 } => (x0.min(x1), y0.min(y1), x0.max(x1), y0.max(y1)),
+            Shape::Circle { cx, cy, r } => (cx - r, cy - r, cx + r, cy + r),
+            Shape::Poly { .. } => {
+                let c = self.corners();
+                let f = |g: fn(f32, f32) -> f32, i: usize, init: f32| c.iter().map(|p| if i == 0 { p.0 } else { p.1 }).fold(init, g);
+                (f(f32::min, 0, f32::MAX), f(f32::min, 1, f32::MAX), f(f32::max, 0, f32::MIN), f(f32::max, 1, f32::MIN))
+            }
+        }
+    }
+
+    /// Is the picture point inside (areas, circles, polygons)?
+    fn contains(&self, x: f32, y: f32) -> bool {
+        match *self {
+            Shape::Area { x0, y0, x1, y1 } => x >= x0.min(x1) && x <= x0.max(x1) && y >= y0.min(y1) && y <= y0.max(y1),
+            Shape::Circle { cx, cy, r } => (x - cx).powi(2) + (y - cy).powi(2) <= r * r,
+            Shape::Poly { .. } => point_in_poly(self.corners(), x, y),
+            _ => false,
+        }
+    }
+}
+
+/// Even-odd rule.
+fn point_in_poly(c: &[(f32, f32)], x: f32, y: f32) -> bool {
+    let mut inside = false;
+    let mut j = c.len().wrapping_sub(1);
+    for i in 0..c.len() {
+        let (xi, yi) = c[i];
+        let (xj, yj) = c[j];
+        if (yi > y) != (yj > y) && x < (xj - xi) * (y - yi) / (yj - yi) + xi {
+            inside = !inside;
+        }
+        j = i;
+    }
+    inside
+}
+
+/// Which outline the area tool draws.
+#[derive(Clone, Copy, PartialEq)]
+enum AreaKind {
+    Rect,
+    Circle,
+    Poly,
+}
+
+impl AreaKind {
+    fn name(&self) -> &'static str {
+        match self {
+            AreaKind::Rect => "Rechteck",
+            AreaKind::Circle => "Kreis",
+            AreaKind::Poly => "Polygon",
+        }
+    }
+}
+
+/// Small outline icon of an area kind, drawn into `r`.
+fn area_icon(p: &egui::Painter, r: Rect, kind: AreaKind, col: Color32) {
+    let st = Stroke::new(1.8, col);
+    let c = r.center();
+    let s = r.width().min(r.height()) * 0.5;
+    match kind {
+        AreaKind::Rect => {
+            p.rect_stroke(Rect::from_center_size(c, Vec2::new(s * 1.6, s * 1.2)), 1.0, st, StrokeKind::Middle);
+        }
+        AreaKind::Circle => {
+            p.circle_stroke(c, s * 0.75, st);
+        }
+        AreaKind::Poly => {
+            let pts: Vec<Pos2> = [(-0.8, 0.2), (-0.3, -0.75), (0.65, -0.45), (0.8, 0.55), (-0.2, 0.75)]
+                .iter()
+                .map(|(x, y)| c + Vec2::new(x * s, y * s))
+                .collect();
+            p.add(egui::Shape::closed_line(pts, st));
+        }
+    }
 }
 
 #[derive(Clone, Copy, Default)]
@@ -130,6 +246,8 @@ impl Tool {
             Shape::Spot { .. } => "Punkt",
             Shape::Area { .. } => "Bereich",
             Shape::Line { .. } => "Linie",
+            Shape::Circle { .. } => "Kreis",
+            Shape::Poly { .. } => "Polygon",
         }
     }
 }
@@ -224,6 +342,11 @@ pub struct ThermoApp {
     tools: Vec<Tool>,
     next_tool_id: u32,
     mode: ToolMode,
+    area_kind: AreaKind,
+    area_menu: bool,
+    area_press: Option<f64>,
+    area_long: bool,
+    poly_draft: Vec<(f32, f32)>,
     drag: Option<Drag>,
     selected_tool: Option<u32>,
 
@@ -349,6 +472,11 @@ impl ThermoApp {
             tools: Vec::new(),
             next_tool_id: 1,
             mode: ToolMode::Select,
+            area_kind: AreaKind::Rect,
+            area_menu: false,
+            area_press: None,
+            area_long: false,
+            poly_draft: Vec::new(),
             drag: None,
             selected_tool: None,
             history: History::new(),
@@ -429,6 +557,14 @@ impl ThermoApp {
         if std::env::var("WBS_TAB").map(|v| v == "can").unwrap_or(false) {
             app.tab = Tab::Can;
         }
+        // WBS_SHAPES=1: add a circle and a polygon and open the area menu (screenshot test)
+        if std::env::var_os("WBS_SHAPES").is_some() {
+            app.add_tool(Shape::Circle { cx: 40.0, cy: 50.0, r: 18.0 });
+            app.add_tool(Shape::poly(&[(120.0, 20.0), (175.0, 30.0), (185.0, 75.0), (140.0, 90.0), (110.0, 60.0)]));
+            app.mode = ToolMode::Area;
+            app.area_kind = AreaKind::Poly;
+            app.area_menu = true;
+        }
         // WBS_CAN=1: try to start the CAN output (manual test; logs the result)
         if std::env::var_os("WBS_CAN").is_some() {
             app.toggle_can();
@@ -481,6 +617,8 @@ impl ThermoApp {
             Shape::Spot { .. } => "P",
             Shape::Area { .. } => "B",
             Shape::Line { .. } => "L",
+            Shape::Circle { .. } => "K",
+            Shape::Poly { .. } => "PG",
         };
         let n = self
             .tools
@@ -761,11 +899,7 @@ impl ThermoApp {
     fn curve_key(&self) -> String {
         let mut k = format!("{:?}", self.emission);
         for t in &self.tools {
-            let sh = match t.shape {
-                Shape::Spot { x, y } => format!("{x},{y}"),
-                Shape::Area { x0, y0, x1, y1 } | Shape::Line { x0, y0, x1, y1 } => format!("{x0},{y0},{x1},{y1}"),
-            };
-            k.push_str(&format!("|{}:{}", t.id, sh));
+            k.push_str(&format!("|{}:{:?}", t.id, t.shape));
         }
         k
     }
@@ -1121,6 +1255,14 @@ impl ThermoApp {
                 Shape::Spot { x, y } => m.push(Mark::Cross { x, y, color: t.color }),
                 Shape::Area { x0, y0, x1, y1 } => m.push(Mark::Rect { x0, y0, x1, y1, color: t.color }),
                 Shape::Line { x0, y0, x1, y1 } => m.push(Mark::Line { x0, y0, x1, y1, color: t.color }),
+                Shape::Circle { cx, cy, r } => {
+                    let pts = (0..48).map(|i| {
+                        let a = i as f32 / 48.0 * std::f32::consts::TAU;
+                        (cx + r * a.cos(), cy + r * a.sin())
+                    });
+                    m.push(Mark::Poly { pts: pts.collect(), color: t.color });
+                }
+                Shape::Poly { .. } => m.push(Mark::Poly { pts: t.shape.corners().to_vec(), color: t.color }),
             }
         }
         if self.show_center {
@@ -1156,10 +1298,13 @@ impl ThermoApp {
                         let (a, b) = at(x, y);
                         (a, b, Anchor::Point)
                     }
-                    Shape::Area { x0, y0, x1, y1 } => (x0.min(x1) * sf, y0.min(y1) * sf, Anchor::Corner),
                     Shape::Line { x0, y0, .. } => {
                         let (a, b) = at(x0, y0);
                         (a, b, Anchor::Point)
+                    }
+                    _ => {
+                        let (x0, y0, _, _) = t.shape.bbox();
+                        (x0.max(0.0) * sf, y0.max(0.0) * sf, Anchor::Corner)
                     }
                 };
                 labels.push(Label { x, y, anchor, text, color: t.color });
@@ -1220,9 +1365,9 @@ impl ThermoApp {
         for t in &self.tools {
             match t.shape {
                 Shape::Spot { x, y } => add(&t.name, format!("Messpunkt {} (x {}, y {})", t.name, x as i32, y as i32), t.reading.value, &mut sig, &mut val),
-                Shape::Area { x0, y0, x1, y1 } | Shape::Line { x0, y0, x1, y1 } => {
-                    let kind = if matches!(t.shape, Shape::Area { .. }) { "Bereich" } else { "Linie" };
-                    let pos = format!("{} {} ({} {} – {} {})", kind, t.name, x0 as i32, y0 as i32, x1 as i32, y1 as i32);
+                _ => {
+                    let (x0, y0, x1, y1) = t.shape.bbox();
+                    let pos = format!("{} {} ({} {} – {} {})", t.kind_name(), t.name, x0 as i32, y0 as i32, x1 as i32, y1 as i32);
                     add(&format!("{}_Max", t.name), format!("{pos}: Maximum"), t.reading.max, &mut sig, &mut val);
                     add(&format!("{}_Mittel", t.name), format!("{pos}: Mittelwert"), t.reading.avg, &mut sig, &mut val);
                     add(&format!("{}_Min", t.name), format!("{pos}: Minimum"), t.reading.min, &mut sig, &mut val);
@@ -1654,6 +1799,7 @@ impl ThermoApp {
                     Some("punkt") => Shape::Spot { x: cx(x0), y: cy(y0) },
                     Some("bereich") => Shape::Area { x0: cx(x0.min(x1)), y0: cy(y0.min(y1)), x1: cx(x0.max(x1)), y1: cy(y0.max(y1)) },
                     Some("linie") => Shape::Line { x0: cx(x0), y0: cy(y0), x1: cx(x1), y1: cy(y1) },
+                    Some("kreis") => Shape::Circle { cx: cx(x0), cy: cy(y0), r: ((x1 - x0).powi(2) + (y1 - y0).powi(2)).sqrt().max(1.0) },
                     _ => return,
                 };
                 let id = self.add_tool(shape);
@@ -2072,6 +2218,80 @@ impl ThermoApp {
 
     // ------------------------------------------------------------ UI: left tools
 
+    /// Area tool button: shows the chosen outline; a long press (or right click) opens
+    /// the choice Rechteck / Kreis / Polygon.
+    fn area_button(&mut self, ui: &mut egui::Ui) {
+        let b = egui::Button::new("").min_size(Vec2::new(40.0, 40.0)).selected(self.mode == ToolMode::Area);
+        let r = ui.add(b).on_hover_text(format!(
+            "Messbereich: {}\nLange drücken oder Rechtsklick: Rechteck, Kreis oder Polygon wählen",
+            self.area_kind.name()
+        ));
+        let col = if self.mode == ToolMode::Area { Color32::WHITE } else { Color32::from_gray(220) };
+        area_icon(ui.painter(), r.rect.shrink(9.0), self.area_kind, col);
+        // small corner triangle = has a menu
+        let c = r.rect.right_bottom() + Vec2::new(-5.0, -5.0);
+        ui.painter().add(egui::Shape::convex_polygon(vec![c, c + Vec2::new(-6.0, 0.0), c + Vec2::new(0.0, -6.0)], MUTED, Stroke::NONE));
+
+        let now = ui.input(|i| i.time);
+        if r.is_pointer_button_down_on() {
+            let start = *self.area_press.get_or_insert(now);
+            if now - start > 0.45 && !self.area_long {
+                self.area_long = true;
+                self.area_menu = true;
+            }
+            ui.ctx().request_repaint();
+        } else {
+            self.area_press = None;
+        }
+        if r.clicked() {
+            if self.area_long {
+                self.area_long = false; // the release after a long press only opens the menu
+            } else {
+                self.mode = ToolMode::Area;
+            }
+        }
+        if r.secondary_clicked() {
+            self.area_menu = !self.area_menu;
+        }
+        if !self.area_menu {
+            return;
+        }
+        let menu = egui::Area::new(ui.scope_id().with("area_menu"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(r.rect.right_top() + Vec2::new(6.0, 0.0))
+            .show(ui.ctx(), |ui| {
+                egui::Frame::new()
+                    .fill(PANEL)
+                    .stroke(Stroke::new(1.0, Color32::from_gray(70)))
+                    .corner_radius(6.0)
+                    .inner_margin(6.0)
+                    .show(ui, |ui| {
+                        ui.label(RichText::new("Messbereich").small().color(MUTED));
+                        for k in [AreaKind::Rect, AreaKind::Circle, AreaKind::Poly] {
+                            let sel = self.area_kind == k;
+                            let (row, resp) = ui.allocate_exact_size(Vec2::new(150.0, 30.0), Sense::click());
+                            if resp.hovered() || sel {
+                                ui.painter().rect_filled(row, 4.0, if sel { ACCENT.gamma_multiply(0.35) } else { CARD });
+                            }
+                            area_icon(ui.painter(), Rect::from_min_size(row.min + Vec2::new(6.0, 5.0), Vec2::new(20.0, 20.0)), k, Color32::WHITE);
+                            ui.painter().text(row.left_center() + Vec2::new(34.0, 0.0), Align2::LEFT_CENTER, k.name(), FontId::proportional(14.0), Color32::WHITE);
+                            if resp.clicked() {
+                                self.area_kind = k;
+                                self.mode = ToolMode::Area;
+                                self.area_menu = false;
+                                self.poly_draft.clear();
+                            }
+                        }
+                    });
+            });
+        if menu.response.clicked_elsewhere() && !r.hovered() {
+            self.area_menu = false;
+        }
+        if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.area_menu = false;
+        }
+    }
+
     fn tool_bar(&mut self, ui: &mut egui::Ui) {
         ui.add_space(6.0);
         ui.vertical_centered(|ui| {
@@ -2082,6 +2302,10 @@ impl ThermoApp {
                 (ToolMode::Line, "╱", "Messlinie ziehen (Profil)"),
             ];
             for (m, icon, tip) in items {
+                if m == ToolMode::Area {
+                    self.area_button(ui);
+                    continue;
+                }
                 let b = egui::Button::new(RichText::new(icon).size(20.0)).min_size(Vec2::new(40.0, 40.0)).selected(self.mode == m);
                 if ui.add(b).on_hover_text(tip).clicked() {
                     self.mode = m;
@@ -2180,6 +2404,21 @@ impl ThermoApp {
                         }
                     }
                     Shape::Line { x0, y0, x1, y1 } => seg_dist(p, to_screen(x0, y0), to_screen(x1, y1)),
+                    Shape::Circle { .. } | Shape::Poly { .. } => {
+                        let (ix, iy) = to_img(p);
+                        if t.shape.contains(ix, iy) {
+                            0.5
+                        } else {
+                            // near the outline also counts
+                            let c = t.shape.corners();
+                            match t.shape {
+                                Shape::Circle { cx, cy, r } => ((to_screen(cx, cy).distance(p)) - r * sx).abs(),
+                                _ => (0..c.len())
+                                    .map(|i| seg_dist(p, to_screen(c[i].0, c[i].1), to_screen(c[(i + 1) % c.len()].0, c[(i + 1) % c.len()].1)))
+                                    .fold(f32::MAX, f32::min),
+                            }
+                        }
+                    }
                 };
                 if d < 12.0 && best.map(|b| d < b.0).unwrap_or(true) {
                     best = Some((d, t.id));
@@ -2192,13 +2431,13 @@ impl ThermoApp {
             if let Some(p0) = press {
                 let ip = clampf(to_img(p0));
                 let hit_id = hit(&self.tools, p0);
-                let creating = matches!(self.mode, ToolMode::Area | ToolMode::Line);
+                let creating = self.mode == ToolMode::Line || (self.mode == ToolMode::Area && self.area_kind != AreaKind::Poly);
                 if creating {
                     if self.tools.len() < 16 {
-                        let shape = if self.mode == ToolMode::Area {
-                            Shape::Area { x0: ip.0, y0: ip.1, x1: ip.0, y1: ip.1 }
-                        } else {
-                            Shape::Line { x0: ip.0, y0: ip.1, x1: ip.0, y1: ip.1 }
+                        let shape = match (self.mode, self.area_kind) {
+                            (ToolMode::Area, AreaKind::Circle) => Shape::Circle { cx: ip.0, cy: ip.1, r: 0.0 },
+                            (ToolMode::Area, _) => Shape::Area { x0: ip.0, y0: ip.1, x1: ip.0, y1: ip.1 },
+                            _ => Shape::Line { x0: ip.0, y0: ip.1, x1: ip.0, y1: ip.1 },
                         };
                         let id = self.add_tool(shape);
                         self.selected_tool = Some(id);
@@ -2222,14 +2461,11 @@ impl ThermoApp {
                         match orig {
                             Shape::Area { .. } => Shape::Area { x0: start.0, y0: start.1, x1: ip.0, y1: ip.1 },
                             Shape::Line { .. } => Shape::Line { x0: start.0, y0: start.1, x1: ip.0, y1: ip.1 },
+                            Shape::Circle { .. } => Shape::Circle { cx: start.0, cy: start.1, r: (dx * dx + dy * dy).sqrt() },
                             s => s,
                         }
                     } else {
-                        let mut s = match orig {
-                            Shape::Spot { x, y } => Shape::Spot { x: x + dx, y: y + dy },
-                            Shape::Area { x0, y0, x1, y1 } => Shape::Area { x0: x0 + dx, y0: y0 + dy, x1: x1 + dx, y1: y1 + dy },
-                            Shape::Line { x0, y0, x1, y1 } => Shape::Line { x0: x0 + dx, y0: y0 + dy, x1: x1 + dx, y1: y1 + dy },
-                        };
+                        let mut s = orig.translate(dx, dy);
                         clamp_shape(&mut s, fw as f32, fh as f32);
                         s
                     };
@@ -2242,6 +2478,7 @@ impl ThermoApp {
                     let small = self.tools.iter().find(|t| t.id == d.tool_id).map(|t| match t.shape {
                         Shape::Area { x0, y0, x1, y1 } => (x1 - x0).abs() < 2.0 || (y1 - y0).abs() < 2.0,
                         Shape::Line { x0, y0, x1, y1 } => (x1 - x0).abs() + (y1 - y0).abs() < 3.0,
+                        Shape::Circle { r, .. } => r < 1.5,
                         _ => false,
                     });
                     if small == Some(true) {
@@ -2259,7 +2496,48 @@ impl ThermoApp {
                 }
             }
         }
-        if resp.clicked() {
+        // polygon: click corners, finish on the first corner, by double click, Enter or right click
+        let drafting = self.mode == ToolMode::Area && self.area_kind == AreaKind::Poly;
+        if !drafting {
+            self.poly_draft.clear();
+        }
+        let mut finish_poly = false;
+        if drafting {
+            let (enter, esc, back) = ui.input(|i| (i.key_pressed(egui::Key::Enter), i.key_pressed(egui::Key::Escape), i.key_pressed(egui::Key::Backspace)));
+            if esc {
+                self.poly_draft.clear();
+            }
+            if back {
+                self.poly_draft.pop();
+            }
+            if enter || resp.double_clicked() || (resp.secondary_clicked() && !self.poly_draft.is_empty()) {
+                finish_poly = true;
+            } else if resp.clicked() {
+                if let Some(p) = resp.interact_pointer_pos() {
+                    let ip = clampf(to_img(p));
+                    let near_first = self.poly_draft.first().map(|f| to_screen(f.0, f.1).distance(p) < 10.0).unwrap_or(false);
+                    let near_last = self.poly_draft.last().map(|l| to_screen(l.0, l.1).distance(p) < 3.0).unwrap_or(false);
+                    if near_first && self.poly_draft.len() >= 3 {
+                        finish_poly = true;
+                    } else if !near_last && self.tools.len() < 16 {
+                        self.poly_draft.push(ip);
+                        if self.poly_draft.len() >= MAX_POLY {
+                            finish_poly = true;
+                        }
+                    }
+                }
+            }
+        }
+        if finish_poly {
+            let pts = std::mem::take(&mut self.poly_draft);
+            if pts.len() >= 3 {
+                let id = self.add_tool(Shape::poly(&pts));
+                self.selected_tool = Some(id);
+                let name = self.tools.last().map(|t| t.name.clone()).unwrap_or_default();
+                self.log(format!("Messwerkzeug {name} hinzugefügt ({} Ecken)", pts.len()));
+            }
+        }
+        if resp.clicked() && !drafting {
             if let Some(p) = resp.interact_pointer_pos() {
                 let h = hit(&self.tools, p);
                 if self.mode == ToolMode::Spot && h.is_none() {
@@ -2275,7 +2553,7 @@ impl ThermoApp {
                 }
             }
         }
-        if resp.secondary_clicked() {
+        if resp.secondary_clicked() && !drafting {
             if let Some(p) = resp.interact_pointer_pos() {
                 if let Some(id) = hit(&self.tools, p) {
                     self.remove_tool(id);
@@ -2321,6 +2599,38 @@ impl ThermoApp {
                     extreme_marks(&painter, t, col, &to_screen);
                     label_box(&painter, a + Vec2::new(0.0, 8.0), &label, col, &font);
                 }
+                Shape::Circle { cx, cy, r } => {
+                    let c = to_screen(cx, cy);
+                    painter.circle_stroke(c, r * sx, shadow);
+                    painter.circle_stroke(c, r * sx, st);
+                    extreme_marks(&painter, t, col, &to_screen);
+                    label_box(&painter, c + Vec2::new(-r * sx, -r * sx - 22.0), &label, col, &font);
+                }
+                Shape::Poly { .. } => {
+                    let pts: Vec<Pos2> = t.shape.corners().iter().map(|p| to_screen(p.0, p.1)).collect();
+                    painter.add(egui::Shape::closed_line(pts.clone(), shadow));
+                    painter.add(egui::Shape::closed_line(pts.clone(), st));
+                    extreme_marks(&painter, t, col, &to_screen);
+                    let (x0, y0, _, _) = t.shape.bbox();
+                    label_box(&painter, to_screen(x0, y0) + Vec2::new(0.0, -22.0), &label, col, &font);
+                }
+            }
+        }
+        // polygon being drawn
+        if !self.poly_draft.is_empty() {
+            let st = Stroke::new(2.0, ACCENT);
+            let pts: Vec<Pos2> = self.poly_draft.iter().map(|p| to_screen(p.0, p.1)).collect();
+            for w2 in pts.windows(2) {
+                painter.line_segment([w2[0], w2[1]], st);
+            }
+            if let (Some(last), Some(hp)) = (pts.last(), resp.hover_pos()) {
+                painter.line_segment([*last, hp], Stroke::new(1.2, ACCENT.gamma_multiply(0.7)));
+            }
+            for (i, p) in pts.iter().enumerate() {
+                if i == 0 && pts.len() >= 3 {
+                    painter.circle_stroke(*p, 8.0, Stroke::new(1.5, Color32::WHITE));
+                }
+                painter.circle_filled(*p, 3.5, ACCENT);
             }
         }
         if self.frame.is_some() {
@@ -2384,7 +2694,17 @@ impl ThermoApp {
         let mode_hint = match self.mode {
             ToolMode::Select => "Werkzeug ziehen zum Verschieben · Rechtsklick löscht",
             ToolMode::Spot => "Klicken, um einen Messpunkt zu setzen",
-            ToolMode::Area => "Ziehen, um einen Messbereich aufzuziehen",
+            ToolMode::Area => match self.area_kind {
+                AreaKind::Rect => "Ziehen, um ein Rechteck aufzuziehen",
+                AreaKind::Circle => "Vom Mittelpunkt aus ziehen, um einen Kreis aufzuziehen",
+                AreaKind::Poly => {
+                    if self.poly_draft.is_empty() {
+                        "Ecken des Polygons nacheinander anklicken"
+                    } else {
+                        "Weitere Ecken klicken · Abschluss: erste Ecke, Doppelklick, Enter oder Rechtsklick · Esc bricht ab"
+                    }
+                }
+            },
             ToolMode::Line => "Ziehen, um eine Messlinie zu legen",
         };
         label_box(&painter, Pos2::new(img_rect.left() + 8.0, img_rect.bottom() - 26.0), mode_hint, Color32::from_white_alpha(200), &FontId::proportional(12.0));
@@ -3296,7 +3616,45 @@ fn measure(shape: &Shape, temps: &[f32], w: usize, h: usize) -> Reading {
     if temps.len() != w * h || w == 0 || h == 0 {
         return Reading { value: f32::NAN, min: f32::NAN, max: f32::NAN, avg: f32::NAN, max_pos: (0, 0), min_pos: (0, 0) };
     }
+    if matches!(shape, Shape::Circle { .. } | Shape::Poly { .. }) {
+        // all pixels whose centre lies inside the outline
+        let (bx0, by0, bx1, by1) = shape.bbox();
+        let cl = |v: f32, m: usize| v.clamp(0.0, (m - 1) as f32);
+        let (a, c) = (cl(bx0.floor(), w) as usize, cl(bx1.ceil(), w) as usize);
+        let (b, d) = (cl(by0.floor(), h) as usize, cl(by1.ceil(), h) as usize);
+        let mut r = Reading { value: 0.0, min: f32::MAX, max: f32::MIN, avg: 0.0, max_pos: (a, b), min_pos: (a, b) };
+        let mut sum = 0.0f64;
+        let mut n = 0usize;
+        for y in b..=d {
+            for x in a..=c {
+                if !shape.contains(x as f32, y as f32) {
+                    continue;
+                }
+                let t = temps[y * w + x];
+                sum += t as f64;
+                n += 1;
+                if t < r.min {
+                    r.min = t;
+                    r.min_pos = (x, y);
+                }
+                if t > r.max {
+                    r.max = t;
+                    r.max_pos = (x, y);
+                }
+            }
+        }
+        if n == 0 {
+            // tiny outline: use the pixel in the middle
+            let (x, y) = (cl(((bx0 + bx1) / 2.0).round(), w) as usize, cl(((by0 + by1) / 2.0).round(), h) as usize);
+            let v = temps[y * w + x];
+            return Reading { value: v, min: v, max: v, avg: v, max_pos: (x, y), min_pos: (x, y) };
+        }
+        r.avg = (sum / n as f64) as f32;
+        r.value = r.max;
+        return r;
+    }
     match *shape {
+        Shape::Circle { .. } | Shape::Poly { .. } => unreachable!(),
         Shape::Spot { x, y } => {
             let (xi, yi) = (x.round().clamp(0.0, (w - 1) as f32) as usize, y.round().clamp(0.0, (h - 1) as f32) as usize);
             let v = spot_value(temps, w, h, xi, yi);
@@ -3442,6 +3800,14 @@ fn clamp_shape(s: &mut Shape, w: f32, h: f32) {
             Shape::Area { x0: nx0, y0: ny0, x1: nx0 + bw, y1: ny0 + bh }
         }
         Shape::Line { x0, y0, x1, y1 } => Shape::Line { x0: cx(x0), y0: cy(y0), x1: cx(x1), y1: cy(y1) },
+        Shape::Circle { cx: x, cy: y, r } => Shape::Circle { cx: cx(x), cy: cy(y), r: r.min(w.max(h)) },
+        Shape::Poly { .. } => {
+            // move the whole polygon back inside, keeping its form
+            let (x0, y0, x1, y1) = s.bbox();
+            let dx = if x0 < 0.0 { -x0 } else if x1 > w - 1.0 { (w - 1.0 - x1).max(-x0) } else { 0.0 };
+            let dy = if y0 < 0.0 { -y0 } else if y1 > h - 1.0 { (h - 1.0 - y1).max(-y0) } else { 0.0 };
+            s.translate(dx, dy)
+        }
     };
 }
 
@@ -3710,4 +4076,43 @@ fn temp_dv(v: &mut f32) -> egui::DragValue<'_> {
         .suffix(" °C")
         .custom_formatter(|n, _| fmt_num(n as f32, 1))
         .custom_parser(|s| s.replace(',', ".").replace("°C", "").trim().parse::<f64>().ok())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 10×10 picture whose temperature is the x coordinate.
+    fn ramp() -> Vec<f32> {
+        (0..100).map(|i| (i % 10) as f32).collect()
+    }
+
+    #[test]
+    fn circle_measure() {
+        let r = measure(&Shape::Circle { cx: 5.0, cy: 5.0, r: 2.0 }, &ramp(), 10, 10);
+        assert_eq!(r.min, 3.0);
+        assert_eq!(r.max, 7.0);
+        assert!((r.avg - 5.0).abs() < 1e-4);
+        assert_eq!(r.max_pos.0, 7);
+    }
+
+    #[test]
+    fn polygon_measure() {
+        // triangle with its left edge at x = 1 and tip at x = 8
+        let tri = Shape::poly(&[(1.0, 1.0), (8.0, 4.5), (1.0, 8.0)]);
+        assert!(tri.contains(2.0, 4.0));
+        assert!(!tri.contains(8.0, 1.0));
+        let r = measure(&tri, &ramp(), 10, 10);
+        assert_eq!(r.min, 1.0);
+        assert!(r.max >= 6.0 && r.max <= 8.0);
+        assert!(r.avg < 4.0, "more pixels near the wide left side: {}", r.avg);
+    }
+
+    #[test]
+    fn polygon_moves_and_stays_inside() {
+        let mut p = Shape::poly(&[(0.0, 0.0), (4.0, 0.0), (4.0, 4.0)]).translate(8.0, 8.0);
+        clamp_shape(&mut p, 10.0, 10.0);
+        let (x0, y0, x1, y1) = p.bbox();
+        assert_eq!((x0, y0, x1, y1), (5.0, 5.0, 9.0, 9.0));
+    }
 }

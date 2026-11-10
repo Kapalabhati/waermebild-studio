@@ -19,6 +19,8 @@ pub enum Mark {
     Cross { x: f32, y: f32, color: Color32 },
     Rect { x0: f32, y0: f32, x1: f32, y1: f32, color: Color32 },
     Line { x0: f32, y0: f32, x1: f32, y1: f32, color: Color32 },
+    /// closed outline through the given points (circles are passed as many points)
+    Poly { pts: Vec<(f32, f32)>, color: Color32 },
 }
 
 /// Colour picture of a frame, scaled up, with marks and an optional colour bar.
@@ -42,6 +44,13 @@ pub fn render_rgb(
     };
     let sf = s as f32;
     for m in marks {
+        if let Mark::Poly { pts, color } = m {
+            for i in 0..pts.len() {
+                let (a, b) = (pts[i], pts[(i + 1) % pts.len()]);
+                draw_line(&mut img, (a.0 + 0.5) * sf, (a.1 + 0.5) * sf, (b.0 + 0.5) * sf, (b.1 + 0.5) * sf, *color);
+            }
+            continue;
+        }
         match *m {
             Mark::Cross { x, y, color } => {
                 let (cx, cy) = ((x + 0.5) * sf, (y + 0.5) * sf);
@@ -56,6 +65,7 @@ pub fn render_rgb(
                 draw_line(&mut img, c, d, a, d, color);
                 draw_line(&mut img, a, d, a, b, color);
             }
+            Mark::Poly { .. } => {}
             Mark::Line { x0, y0, x1, y1, color } => {
                 draw_line(&mut img, (x0 + 0.5) * sf, (y0 + 0.5) * sf, (x1 + 0.5) * sf, (y1 + 0.5) * sf, color);
             }

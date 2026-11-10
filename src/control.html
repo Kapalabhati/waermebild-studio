@@ -85,6 +85,7 @@
       <button data-mode="" class="on" title="Nur ansehen">👆 Ansehen</button>
       <button data-mode="punkt" title="Klick ins Bild setzt einen Messpunkt">+ Punkt</button>
       <button data-mode="bereich" title="Im Bild ziehen">⬜ Bereich</button>
+      <button data-mode="kreis" title="Vom Mittelpunkt aus ziehen">◯ Kreis</button>
       <button data-mode="linie" title="Im Bild ziehen">╱ Linie</button>
       <span class="hint" id="modehint"></span>
       <span class="sp" style="flex:1"></span>
@@ -228,7 +229,7 @@ document.querySelectorAll(".tabs button").forEach(b => b.addEventListener("click
   document.querySelectorAll(".tabs button").forEach(x => x.classList.toggle("on", x === b));
   document.querySelectorAll(".pane").forEach(p => p.classList.toggle("show", p.id === "p_" + b.dataset.tab));
 }));
-const hints = { "": "", punkt: "Ins Bild klicken", bereich: "Im Bild ziehen", linie: "Im Bild ziehen" };
+const hints = { "": "", punkt: "Ins Bild klicken", bereich: "Im Bild ziehen", kreis: "Vom Mittelpunkt aus ziehen", linie: "Im Bild ziehen" };
 document.querySelectorAll("[data-mode]").forEach(b => b.addEventListener("click", () => {
   mode = b.dataset.mode;
   document.querySelectorAll("[data-mode]").forEach(x => x.classList.toggle("on", x === b));
@@ -278,6 +279,7 @@ cv.addEventListener("pointermove", ev => {
   cv.width = cv.clientWidth; cv.height = cv.clientHeight;
   ctx.strokeStyle = "#ff8a1f"; ctx.lineWidth = 2; ctx.setLineDash([6, 4]);
   if (mode === "bereich") ctx.strokeRect(drag.a.sx, drag.a.sy, drag.b.sx - drag.a.sx, drag.b.sy - drag.a.sy);
+  else if (mode === "kreis") { ctx.beginPath(); ctx.arc(drag.a.sx, drag.a.sy, Math.hypot(drag.b.sx - drag.a.sx, drag.b.sy - drag.a.sy), 0, 2 * Math.PI); ctx.stroke(); }
   else { ctx.beginPath(); ctx.moveTo(drag.a.sx, drag.a.sy); ctx.lineTo(drag.b.sx, drag.b.sy); ctx.stroke(); }
 });
 cv.addEventListener("pointerup", () => {
