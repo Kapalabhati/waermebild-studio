@@ -337,6 +337,8 @@ pub struct ThermoApp {
     unit: TempUnit,
 
     emission: EmissionSettings,
+    /// Material last picked in the list; several share the same ε.
+    material: Option<&'static str>,
     lut: TempLut,
 
     tools: Vec<Tool>,
@@ -469,6 +471,7 @@ impl ThermoApp {
             unit: TempUnit::Celsius,
             lut: TempLut::build(&emission),
             emission,
+            material: None,
             tools: Vec::new(),
             next_tool_id: 1,
             mode: ToolMode::Select,
@@ -3022,20 +3025,23 @@ impl ThermoApp {
         ui.add(egui::Slider::new(&mut self.emission.emissivity, 0.01..=1.0).fixed_decimals(2).step_by(0.01));
         ui.horizontal(|ui| {
             ui.label("Material:");
+            let matches = |m: &(&str, f32)| (m.1 - self.emission.emissivity).abs() < 0.001;
             let cur = MATERIALS
                 .iter()
-                .find(|(_, e)| (*e - self.emission.emissivity).abs() < 0.001)
+                .find(|m| Some(m.0) == self.material && matches(m))
+                .or_else(|| MATERIALS.iter().find(|m| matches(m)))
                 .map(|m| m.0)
                 .unwrap_or("eigener Wert");
             egui::ComboBox::from_id_salt("material").width(190.0).selected_text(cur).show_ui(ui, |ui| {
                 for (name, e) in MATERIALS {
-                    if ui.selectable_label(false, format!("{name}  ({})", fmt_num(*e, 2))).clicked() {
+                    if ui.selectable_label(*name == cur, format!("{name}  ({})", fmt_num(*e, 2))).clicked() {
                         self.emission.emissivity = *e;
+                        self.material = Some(name);
                     }
                 }
             });
         });
-        ui.label(RichText::new("Glänzende Metalle spiegeln stark – dort am besten mattes Klebeband (ε 0,95) aufkleben und darauf messen.").small().color(MUTED));
+        ui.label(RichText::new("Glänzende Metalle spiegeln stark – dort am besten mattes Klebeband aufkleben oder Kreidespray auftragen (ε 0,95) und darauf messen.").small().color(MUTED));
         section(ui, "Umgebung");
         egui::Grid::new("env").num_columns(2).spacing([10.0, 8.0]).show(ui, |ui| {
             ui.label("Reflektierte Temperatur");

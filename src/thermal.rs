@@ -395,6 +395,8 @@ pub const MATERIALS: &[(&str, f32)] = &[
     ("Textil", 0.90),
     ("Erde / Boden", 0.93),
     ("Isolierband", 0.95),
+    ("Kreide", 0.95),
+    ("Kreidespray", 0.95),
     ("Stahl, oxidiert", 0.79),
     ("Gusseisen, oxidiert", 0.64),
     ("Kupfer, oxidiert", 0.65),
