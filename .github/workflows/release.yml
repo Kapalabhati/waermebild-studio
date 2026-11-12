@@ -1,0 +1,93 @@
+# Builds waermebild-studio.exe on GitHub, has it signed by SignPath (once the
+# SignPath settings exist) and attaches it to a release.
+#
+# - Push a tag like v0.6.0  -> build, sign, create a draft release
+# - "Run workflow" by hand  -> build (and sign) only, result under the run's artifacts
+#
+# SignPath settings (repository -> Settings -> Secrets and variables -> Actions):
+#   secret   SIGNPATH_API_TOKEN
+#   variable SIGNPATH_ORGANIZATION_ID
+# Without them the .exe is released unsigned.
+
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    env:
+      SIGN: ${{ vars.SIGNPATH_ORGANIZATION_ID != '' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Version im Tag und in Cargo.toml vergleichen
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        run: |
+          version=$(grep -m1 '^version' Cargo.toml | cut -d '"' -f2)
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME passt nicht zu version = \"$version\" in Cargo.toml"
+            exit 1
+          fi
+
+      - name: Bauen
+        run: cargo build --release --locked
+
+      - name: Tests
+        run: cargo test --release --locked
+
+      - name: Unsignierte .exe hochladen
+        id: unsigned
+        uses: actions/upload-artifact@v4
+        with:
+          name: waermebild-studio-unsigned
+          path: target/release/waermebild-studio.exe
+          if-no-files-found: error
+
+      - name: Bei SignPath signieren
+        if: env.SIGN == 'true'
+        uses: signpath/github-action-submit-signing-request@v1
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: waermebild-studio
+          signing-policy-slug: release-signing
+          artifact-configuration-slug: initial
+          github-artifact-id: ${{ steps.unsigned.outputs.artifact-id }}
+          wait-for-completion: true
+          wait-for-completion-timeout-in-seconds: 3600
+          output-artifact-directory: signed
+
+      - name: Ergebnis bereitlegen
+        shell: bash
+        run: |
+          mkdir -p out
+          if [ "$SIGN" = "true" ]; then
+            cp signed/waermebild-studio.exe out/
+          else
+            cp target/release/waermebild-studio.exe out/
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: waermebild-studio
+          path: out/waermebild-studio.exe
+
+      - name: Release-Entwurf anlegen
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" out/waermebild-studio.exe \
+            --draft --title "Wärmebild-Studio ${GITHUB_REF_NAME#v}" --generate-notes

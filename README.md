@@ -65,7 +65,8 @@ Aufnahmen später neu aus. Die Oberfläche ist auf Deutsch.
 ## Herunterladen
 
 Die fertige `waermebild-studio.exe` gibt es unter **Releases**. Sie läuft ohne Installation:
-herunterladen und doppelklicken.
+herunterladen und doppelklicken. Sie wird auf GitHub aus diesem Quellcode gebaut
+(siehe [Code-Signierung](#code-signierung--code-signing-policy)).
 
 ## Kamera
 
@@ -97,3 +98,34 @@ Das Programm liegt danach unter `target/release/waermebild-studio.exe`.
 - **`.tcraw`**: Kopf mit `TCRAW001`, Breite und Höhe (je u32, little-endian), 8 Byte reserviert;
   danach je Bild die Zeit in ms (f64) und die Rohwerte (u16, Kelvin × 64)
 - **Temperatur-Tabelle `.csv`**: eine Zeile pro Bildzeile, Werte in °C nach allen Korrekturen
+
+## Datenschutz
+
+Das Programm sendet keine Daten an andere Rechner im Netzwerk oder im Internet, außer der
+Benutzer richtet das ausdrücklich ein: Der Netzwerk-Stream (eingebauter Webserver) und die
+Ausgabe auf den CAN-Bus sind standardmäßig aus und werden nur im Programm eingeschaltet.
+Es gibt keine Telemetrie und keine Update-Prüfung.
+
+## Code-Signierung / Code signing policy
+
+Free code signing provided by [SignPath.io](https://about.signpath.io/), certificate by
+[SignPath Foundation](https://signpath.org/).
+
+Kostenlose Code-Signierung durch SignPath.io, Zertifikat von der SignPath Foundation.
+Signiert werden nur Programmdateien, die von GitHub Actions aus diesem Repository gebaut
+wurden ([Release-Workflow](.github/workflows/release.yml)); jede Signierung wird von Hand
+freigegeben.
+
+**Team / Rollen**
+
+- Committer und Reviewer: [kapalabathi](https://github.com/kapalabathi)
+- Approver: [kapalabathi](https://github.com/kapalabathi)
+
+**Datenschutz / Privacy:** This program will not transfer any information to other networked
+systems unless specifically requested by the user or the person installing or operating it
+(siehe [Datenschutz](#datenschutz)).
+
+## Lizenz
+
+[MIT](LICENSE). Mitgelieferte Bibliotheken stehen unter eigenen Open-Source-Lizenzen,
+u. a. libusb (LGPL-2.1).
